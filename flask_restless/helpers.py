@@ -30,6 +30,7 @@ from sqlalchemy.sql import func
 from sqlalchemy.sql.expression import _BinaryExpression
 from sqlalchemy.sql.expression import ColumnElement
 from sqlalchemy.inspection import inspect as sqlalchemy_inspect
+from types import MethodType
 
 #: Names of attributes which should definitely not be considered relations when
 #: dynamically computing a list of relations of a SQLAlchemy model.
@@ -321,7 +322,7 @@ def to_dict(instance, deep=None, exclude=None, include=None,
     if include_methods is not None:
         result.update(dict((method, getattr(instance, method)())
                            for method in include_methods
-                           if not '.' in method and type(getattr(instance, method)) == types.MethodType))
+                           if not '.' in method and type(getattr(instance, method)) == MethodType))
     # Check for objects in the dictionary that may not be serializable by
     # default. Convert datetime objects to ISO 8601 format, convert UUID
     # objects to hexadecimal strings, etc.
