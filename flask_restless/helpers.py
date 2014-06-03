@@ -321,7 +321,7 @@ def to_dict(instance, deep=None, exclude=None, include=None,
     if include_methods is not None:
         result.update(dict((method, getattr(instance, method)())
                            for method in include_methods
-                           if not '.' in method))
+                           if not '.' in method and type(getattr(instance, method)) == types.MethodType))
     # Check for objects in the dictionary that may not be serializable by
     # default. Convert datetime objects to ISO 8601 format, convert UUID
     # objects to hexadecimal strings, etc.
