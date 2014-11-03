@@ -1,3 +1,4 @@
+# -*- encoding: utf-8 -*-
 """
     tests.test_views
     ~~~~~~~~~~~~~~~~
@@ -12,6 +13,7 @@
 from datetime import date
 from datetime import datetime
 from datetime import timedelta
+import math
 
 import dateutil
 from flask import json
@@ -23,11 +25,13 @@ else:
     has_flask_sqlalchemy = True
 from sqlalchemy import Column
 from sqlalchemy import ForeignKey
+from sqlalchemy import func
 from sqlalchemy import Integer
 from sqlalchemy import String
 from sqlalchemy import Table
 from sqlalchemy import Unicode
 from sqlalchemy.ext.associationproxy import association_proxy as prox
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import backref
 from sqlalchemy.orm import relationship as rel
 from sqlalchemy.orm.collections import column_mapped_collection as col_mapped
@@ -40,6 +44,7 @@ from .helpers import FlaskTestBase
 from .helpers import skip_unless
 from .helpers import TestSupport
 from .helpers import TestSupportPrefilled
+from .helpers import unregister_fsa_session_signals
 
 
 dumps = json.dumps
@@ -97,6 +102,7 @@ class TestFSAModel(FlaskTestBase):
     def tearDown(self):
         """Drops all tables."""
         self.db.drop_all()
+        unregister_fsa_session_signals()
 
     def test_get(self):
         """Test for the :meth:`views.API.get` method with models defined using
@@ -308,6 +314,9 @@ class TestAPI(TestSupport):
         self.manager.create_api(self.CarModel,
                                 methods=['GET', 'PATCH', 'POST', 'DELETE'])
 
+        self.manager.create_api(self.User, methods=['POST'],
+                                primary_key='email')
+
         # to facilitate searching
         self.app.search = lambda url, q: self.app.get(url + '?q={0}'.format(q))
 
@@ -337,6 +346,8 @@ class TestAPI(TestSupport):
         response = self.app.post('/api/person',
                                  data=dumps({'name': u'George', 'age': 23}))
         assert response.status_code == 400
+        assert json.loads(response.data)['message'] == 'IntegrityError'
+        assert self.session.is_active, "Session is in `partial rollback` state"
 
         # For issue #158 we make sure that the previous failure is rolled back
         # so that we can add valid entries again
@@ -458,11 +469,13 @@ class TestAPI(TestSupport):
 
     def test_post_interval_functions(self):
         oldJSONEncoder = self.flaskapp.json_encoder
+
         class IntervalJSONEncoder(oldJSONEncoder):
             def default(self, obj):
                 if isinstance(obj, timedelta):
                     return int(obj.days * 86400 + obj.seconds)
                 return oldJSONEncoder.default(self, obj)
+
         self.flaskapp.json_encoder = IntervalJSONEncoder
 
         self.manager.create_api(self.Satellite, methods=['GET', 'POST'])
@@ -487,15 +500,23 @@ class TestAPI(TestSupport):
         assert len(loads(response.data)['objects']) == 1
 
         # Test with nested objects
-        data = dict(name='Rodriguez', age=70,
-                    computers=[dict(name='iMac', vendor='Apple',
-                                    programs=[dict(program=
-                                                   dict(name='iPhoto'))])])
+        data = {'name': 'Rodriguez', 'age': 70,
+                'computers': [{'name': 'iMac', 'vendor': 'Apple',
+                               'programs': [{'program': {'name': 'iPhoto'}}]}]}
         response = self.app.post('/api/person', data=dumps(data))
         assert 201 == response.status_code
         response = self.app.get('/api/computer/2/programs')
         programs = loads(response.data)['objects']
         assert programs[0]['program']['name'] == 'iPhoto'
+
+    def test_post_unicode_primary_key(self):
+        """Test for creating a new instance of the database model using the
+        :http:method:`post` method with a Unicode primary key.
+
+        """
+        response = self.app.post('/api/user', data=dumps({'id': 1,
+                                                          'email': u'Юникод'}))
+        assert response.status_code == 201
 
     def test_post_with_single_submodel(self):
         data = {'vendor': u'Apple',  'name': u'iMac',
@@ -531,21 +552,19 @@ class TestAPI(TestSupport):
         assert 200 == response.status_code
         assert 'foo' == loads(response.data)['name']
         # Add a new computer by patching person
-        data = dict(computers=[dict(id=1),
-                               dict(name='iMac', vendor='Apple',
-                                    programs=[dict(program=
-                                                   dict(name='iPhoto'))])])
+        data = {'computers': [{'id': 1},
+                              {'name': 'iMac', 'vendor': 'Apple',
+                               'programs': [{'program': {'name': 'iPhoto'}}]}]}
         response = self.app.patch('/api/person/1', data=dumps(data))
         assert 200 == response.status_code
         response = self.app.get('/api/computer/2/programs')
         programs = loads(response.data)['objects']
         assert programs[0]['program']['name'] == 'iPhoto'
         # Add a program to the computer through the person
-        data = dict(computers=[dict(id=1),
-                               dict(id=2,
-                                    programs=[dict(program_id=1),
-                                              dict(program=
-                                                   dict(name='iMovie'))])])
+        data = {'computers': [{'id': 1},
+                              {'id': 2,
+                               'programs': [{'program_id': 1},
+                                            {'program': {'name': 'iMovie'}}]}]}
         response = self.app.patch('/api/person/1', data=dumps(data))
         assert 200 == response.status_code
         response = self.app.get('/api/computer/2/programs')
@@ -662,6 +681,18 @@ class TestAPI(TestSupport):
         assert vim_relation not in computer['programs']
         assert emacs_relation in computer['programs']
 
+    def test_patch_integrity_error(self):
+        self.session.add(self.Person(name=u"Waldorf", age=89))
+        self.session.add(self.Person(name=u"Statler", age=91))
+        self.session.commit()
+
+        # This errors as expected
+        response = self.app.patch('/api/person/1',
+                                 data=dumps({'name': u'Statler'}))
+        assert response.status_code == 400
+        assert json.loads(response.data)['message'] == 'IntegrityError'
+        assert self.session.is_active, "Session is in `partial rollback` state"
+
     def test_delete(self):
         """Test for deleting an instance of the database using the
         :http:method:`delete` method.
@@ -688,16 +719,24 @@ class TestAPI(TestSupport):
         people = self.session.query(self.Person).filter_by(id=1)
         assert people.count() == 0
 
+    def test_delete_integrity_error(self):
+        """Tests that an :exc:`IntegrityError` raised in a
+        :http:method:`delete` request is caught and returned to the client
+        safely.
+
+        """
+        # TODO Fill me in.
+        pass
+
     def test_delete_absent_instance(self):
         """Test that deleting an instance of the model which does not exist
         fails.
 
-        This should give us the same response as when there is an object there,
-        since the :http:method:`delete` method is an idempotent method.
+        This should give us a 404 when the object is not found.
 
         """
         response = self.app.delete('/api/person/1')
-        assert response.status_code == 204
+        assert response.status_code == 404
 
     def test_disallow_patch_many(self):
         """Tests that disallowing "patch many" requests responds with a
@@ -766,6 +805,8 @@ class TestAPI(TestSupport):
         response = self.app.post('/api/person', data=dumps({}))
         assert 201 == response.status_code
         response = self.app.patch('/api/person/1', data=dumps(dict(bogus=0)))
+        assert 400 == response.status_code
+        response = self.app.patch('/api/person/1', data=dumps(dict(is_minor=True)))
         assert 400 == response.status_code
 
     def test_patch_many(self):
@@ -1209,6 +1250,29 @@ class TestAPI(TestSupport):
         assert response.status_code == 200
         assert loads(response.data) == dict(name='Earth')
 
+    def test_specified_primary_key(self):
+        """Tests that models with more than one primary key are
+        accessible via a specified primary key.
+
+        """
+        self.manager.create_api(self.User, methods=['GET', 'POST', 'PATCH'],
+                                primary_key='email')
+        data = dict(id=1, email='foo', wakeup=None)
+        response = self.app.post('/api/user', data=dumps(data))
+        assert response.status_code == 201
+        response = self.app.get('/api/user/1')
+        assert response.status_code == 404
+        response = self.app.get('/api/user')
+        assert response.status_code == 200
+        assert len(loads(response.data)['objects']) == 1
+        response = self.app.get('/api/user/foo')
+        assert response.status_code == 200
+        assert loads(response.data) == data
+        response = self.app.patch('/api/user/foo', data=dumps(dict(id=2)),
+                                  content_type='application/json')
+        assert 200 == response.status_code
+        assert loads(response.data)['id'] == 2
+
     def test_post_form_preprocessor(self):
         """Tests POST method decoration using a custom function."""
         def decorator_function(data=None, **kw):
@@ -1383,9 +1447,9 @@ class TestAPI(TestSupport):
 
         # create a custom query method for the CarModel class
         def query(cls):
-            car_model = self.session.query(CarModel)
-            return car_model.join(CarManufacturer).filter(
-                CarManufacturer.name==manufacturer_name)
+            car_model = self.session.query(cls)
+            name_filter = (CarManufacturer.name == manufacturer_name)
+            return car_model.join(CarManufacturer).filter(name_filter)
         CarModel.query = classmethod(query)
 
         response = self.app.get('/api/car_model')
@@ -1394,17 +1458,74 @@ class TestAPI(TestSupport):
         assert 2 == len(data['objects'])
 
         for car in data['objects']:
-          assert car['manufacturer']['name'] == manufacturer_name
+            assert car['manufacturer']['name'] == manufacturer_name
 
         for car in [car1, car2]:
-          response = self.app.get('/api/car_model/{0}'.format(car.id))
-          assert 200 == response.status_code
-          data = loads(response.data)
-          assert data['manufacturer_id'] == cm1.id
-          assert data['name'] == car.name
+            response = self.app.get('/api/car_model/{0}'.format(car.id))
+            assert 200 == response.status_code
+            data = loads(response.data)
+            assert data['manufacturer_id'] == cm1.id
+            assert data['name'] == car.name
 
         response = self.app.get('/api/car_model/{0}'.format(car3.id))
         assert 404 == response.status_code
+
+    def test_set_hybrid_property(self):
+        """Tests that a hybrid property can be correctly set by a client."""
+
+        class HybridPerson(self.Person):
+
+            @hybrid_property
+            def abs_other(self):
+                return self.other is not None and abs(self.other) or 0
+
+            @abs_other.expression
+            def abs_other(self):
+                return func.sum(HybridPerson.other)
+
+            @abs_other.setter
+            def abs_other(self, v):
+                self.other = v
+
+            @hybrid_property
+            def sq_other(self):
+                if not isinstance(self.other, float):
+                    return None
+
+                return self.other ** 2
+
+            @sq_other.setter
+            def sq_other(self, v):
+                self.other = math.sqrt(v)
+
+        self.manager.create_api(HybridPerson, methods=['POST', 'PATCH'],
+                                collection_name='hybrid')
+        response = self.app.post('/api/hybrid', data=dumps({'abs_other': 1}))
+        assert 201 == response.status_code
+        data = loads(response.data)
+        assert 1 == data['other']
+        assert 1 == data['abs_other']
+
+        response = self.app.post('/api/hybrid', data=dumps({'name': u'Rod'}))
+        assert 201 == response.status_code
+        response = self.app.patch('/api/hybrid/2', data=dumps({'sq_other': 4}))
+        assert 200 == response.status_code
+        data = loads(response.data)
+        assert 2 == data['other']
+        assert 4 == data['sq_other']
+
+    def test_patch_with_hybrid_property(self):
+        """Tests that a hybrid property can be correctly posted from a client."""
+
+        self.session.add(self.Screen(id=1, width=5, height=4))
+        self.session.commit()
+        self.manager.create_api(self.Screen, methods=['PATCH'], collection_name='screen')
+        response = self.app.patch('/api/screen/1', data=dumps({"number_of_pixels": 50}))
+        assert 200 == response.status_code
+        data = loads(response.data)
+        assert 5 == data['width']
+        assert 10 == data['height']
+        assert 50 == data['number_of_pixels']
 
 
 class TestHeaders(TestSupportPrefilled):
@@ -1694,6 +1815,30 @@ class TestSearch(TestSupportPrefilled):
         resp = self.app.search('/api/person', dumps(search))
         assert resp.status_code == 200
         assert 1 == len(loads(resp.data)['objects'])
+        assert loads(resp.data)['num_results'] == 1
+        assert loads(resp.data)['objects'][0]['name'] == u'Mary'
+
+        # Testing limit by itself
+        search = {'limit': 1}
+        resp = self.app.search('/api/person', dumps(search))
+        assert resp.status_code == 200
+        assert 1 == len(loads(resp.data)['objects'])
+        assert loads(resp.data)['num_results'] == 1
+        assert loads(resp.data)['objects'][0]['name'] == u'Lincoln'
+
+        search = {'limit': 5000}
+        resp = self.app.search('/api/person', dumps(search))
+        assert resp.status_code == 200
+        assert 5 == len(loads(resp.data)['objects'])
+        assert loads(resp.data)['num_results'] == 5
+        assert loads(resp.data)['objects'][0]['name'] == u'Lincoln'
+
+         # Testing offset by itself
+        search = {'offset': 1}
+        resp = self.app.search('/api/person', dumps(search))
+        assert resp.status_code == 200
+        assert 4 == len(loads(resp.data)['objects'])
+        assert loads(resp.data)['num_results'] == 4
         assert loads(resp.data)['objects'][0]['name'] == u'Mary'
 
         # Testing multiple results when calling .one()
@@ -1766,6 +1911,7 @@ class TestAssociationProxy(DatabaseTestBase):
         creator1 = lambda product: ChosenProductImage(product=product)
         creator2 = lambda image: ChosenProductImage(image=image)
         creator3 = lambda key, value: Metadata(key, value)
+
         class Metadata(self.Base):
             def __init__(self, key, value):
                 super(Metadata, self).__init__()
@@ -1891,7 +2037,7 @@ class TestAssociationProxy(DatabaseTestBase):
 
     def test_assoc_dict_put(self):
         data = {'products': [{'id': 1}],
-                'meta':[{'key':'file type', 'value': 'png'}]
+                'meta': [{'key':'file type', 'value': 'png'}]
                }
         response = self.app.post('/api/image', data=dumps(data))
         assert response.status_code == 201
@@ -2068,6 +2214,7 @@ class TestAssociationProxy(DatabaseTestBase):
         assert sorted(data['tag_names']), sorted(['tag1' == 'tag2'])
 
     def test_num_results(self):
+        """Tests that the total number of results is returned."""
         self.session.add(self.Product(tag_names=['tag1', 'tag2']))
         self.session.commit()
 

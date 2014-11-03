@@ -398,12 +398,18 @@ and `postprocessors` can be one of the following strings:
 
 The preprocessors and postprocessors for each type of request accept different
 arguments, but none of them has a return value (more specifically, any returned
-value is ignored). Preprocessors and postprocessors *modify their arguments
-in-place*. The arguments to the preprocessor and postprocessor functions will
-be provided as keyword arguments, so you should always add ``**kw`` as the
-final argument when defining a preprocessor or postprocessor function. This
-way, you can specify only the keyword arguments you need when defining your
-functions.
+value is ignored). Those preprocessors and postprocessors that accept
+dictionaries as parameters can (and should) modify their arguments
+*in-place*. That means the changes made to, for example, the ``result``
+dictionary will be seen by the Flask-Restless view functions and ultimately
+returned to the client.
+
+The arguments to the preprocessor and postprocessor functions will be provided
+as keyword arguments, so you should always add ``**kw`` as the final argument
+when defining a preprocessor or postprocessor function. This way, you can
+specify only the keyword arguments you need when defining your
+functions. Furthermore, if a new version of Flask-Restless changes the API,
+you can update Flask-Restless without breaking your code.
 
 .. versionadded:: 0.13.0
    Functions provided as postprocessors for ``GET_MANY`` and ``PATCH_MANY``
@@ -535,8 +541,8 @@ authentication function can be implemented like this::
         # Next, check if the user is authorized to modify the specified
         # instance of the model.
         if not is_authorized_to_modify(current_user, instance_id):
-            raise ProcessingException(message='Not Authorized',
-                                      status_code=401)
+            raise ProcessingException(description='Not Authorized',
+                                      code=401)
     manager.create_api(Person, preprocessors=dict(GET_SINGLE=[check_auth]))
 
 The :exc:`ProcessingException` allows you to specify an HTTP status code for
@@ -608,28 +614,46 @@ filters* to the ``search_params`` keyword argument. For example::
 
     apimanager.create_api(Person, preprocessors=dict(GET_MANY=[preprocessor]))
 
+.. _customqueries:
+
 Custom queries
---------------
+~~~~~~~~~~~~~~
 
 In cases where it is not possible to use preprocessors or postprocessors
 (:ref:`processors`) efficiently, you can provide a custom ``query`` attribute
-to your model instead. The attribute can either be a callable that returns a
-query::
+to your model instead. The attribute can either be a SQLAlchemy query
+expression or a class method that returns a SQLAlchemy query
+expression. Flask-Restless will use this ``query`` attribute internally,
+however it is defined, instead of the default ``session.query(Model)`` (in the
+pure SQLAlchemy case) or ``Model.query`` (in the Flask-SQLAlchemy
+case). Flask-Restless uses a query during most :http:method:`get` and
+:http:method:`patch` requests to find the model(s) being requested.
+
+You may want to use a custom query attribute if you want to reveal only certain
+information to the client. For example, if you have a set of people and you
+only want to reveal information about people from the group named "students",
+define a query class method this way::
+
+    class Group(Base):
+        __tablename__ = 'group'
+        id = Column(Integer, primary_key=True)
+        groupname = Column(Unicode)
+        people = relationship('Person')
 
     class Person(Base):
         __tablename__ = 'person'
         id = Column(Integer, primary_key=True)
+        group_id = Column(Integer, ForeignKey('group.id'))
+        group = relationship('Group')
 
         @classmethod
         def query(cls):
-            return get_query_for_current_user(cls)
+            original_query = session.query(cls)
+            condition = (Group.groupname == 'students')
+            return original_query.join(Group).filter(condition)
 
-or a SQLAlchemy query expression::
-
-    class Person(Base):
-        __tablename__ = 'person'
-        id = Column(Integer, primary_key=True)
-        query = get_some_query()
+Then requests to, for example, :http:get:`/api/person` will only reveal
+instances of ``Person`` who also are in the group named "students".
 
 .. _authentication:
 
@@ -660,3 +684,31 @@ For a more complete example using `Flask-Login
 :file:`examples/server_configurations/authentication` directory in the source
 distribution, or view it online at `GitHub
 <https://github.com/jfinkels/flask-restless/tree/master/examples/server_configurations/authentication>`_.
+
+Enabling Cross-Origin Resource Sharing (CORS)
+---------------------------------------------
+
+`Cross-Origin Resource Sharing (CORS) <http://enable-cors.org>`_ is a protocol
+that allows JavaScript HTTP clients to make HTTP requests across Internet
+domain boundaries while still protecting against cross-site scripting (XSS)
+attacks. If you have access to the HTTP server that serves your Flask
+application, I recommend configuring CORS there, since such concerns are beyond
+the scope of Flask-Restless. However, in case you need to support CORS at the
+application level, you should create a function that adds the necessary HTTP
+headers after the request has been processed by Flask-Restless (that is, just
+before the HTTP response is sent from the server to the client) using the
+:meth:`flask.Blueprint.after_request` method::
+
+    from flask import Flask
+    from flask.ext.restless import APIManager
+
+    def add_cors_headers(response):
+        response.headers['Access-Control-Allow-Origin'] = 'example.com'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        # Set whatever other headers you like...
+        return response
+
+    app = Flask(__name__)
+    manager = APIManager(app)
+    blueprint = manager.create_api(Person)
+    blueprint.after_request(add_cors_headers)

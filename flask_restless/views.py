@@ -41,7 +41,10 @@ from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm.exc import MultipleResultsFound
 from sqlalchemy.orm.exc import NoResultFound
 from sqlalchemy.orm.query import Query
+from sqlalchemy.sql.schema import Column
+from werkzeug.exceptions import BadRequest
 from werkzeug.exceptions import HTTPException
+from werkzeug.urls import url_quote_plus
 
 from .helpers import count
 from .helpers import evaluate_functions
@@ -59,8 +62,6 @@ from .helpers import session_query
 from .helpers import strings_to_dates
 from .helpers import to_dict
 from .helpers import upper_keys
-from werkzeug.exceptions import BadRequest
-
 from .search import create_query
 from .search import search
 
@@ -102,13 +103,18 @@ def _is_msie8or9():
     """Returns ``True`` if and only if the user agent of the client making the
     request indicates that it is Microsoft Internet Explorer 8 or 9.
 
+    .. note::
+
+       We have no way of knowing if the user agent is lying, so we just make
+       our best guess based on the information provided.
+
     """
-    if request.user_agent is None or request.user_agent.version is None:
-        return False
-    ua = request.user_agent
     # request.user_agent.version comes as a string, so we have to parse it
-    ua_version = tuple(int(d) for d in ua.version.split('.'))
-    return ua.browser == 'msie' and (8, 0) <= ua_version < (10, 0)
+    version = lambda ua: tuple(int(d) for d in ua.version.split('.'))
+    return (request.user_agent is not None
+            and request.user_agent.version is not None
+            and request.user_agent.browser == 'msie'
+            and (8, 0) <= version(request.user_agent) < (10, 0))
 
 
 def create_link_string(page, last_page, per_page):
@@ -139,8 +145,41 @@ def catch_processing_exceptions(func):
             return func(*args, **kw)
         except ProcessingException as exception:
             current_app.logger.exception(str(exception))
-            status, message = exception.code, exception.description or str(exception)
+            status = exception.code
+            message = exception.description or str(exception)
             return jsonify(message=message), status
+    return decorator
+
+
+def catch_integrity_errors(session):
+    """Returns a decorator that catches database integrity errors.
+
+    `session` is the SQLAlchemy session in which all database transactions will
+    be performed.
+
+    View methods can be wrapped like this::
+
+        @catch_integrity_errors(session)
+        def get(self, *args, **kw):
+            return '...'
+
+    Specifically, functions wrapped with the returned decorator catch
+    :exc:`IntegrityError`s, :exc:`DataError`s, and
+    :exc:`ProgrammingError`s. After the exceptions are caught, the session is
+    rolled back, the exception is logged on the current Flask application, and
+    an error response is returned to the client.
+
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapped(*args, **kw):
+            try:
+                return func(*args, **kw)
+            except (DataError, IntegrityError, ProgrammingError) as exception:
+                session.rollback()
+                current_app.logger.exception(str(exception))
+                return dict(message=type(exception).__name__), 400
+        return wrapped
     return decorator
 
 
@@ -283,15 +322,12 @@ def _parse_includes(column_names):
     left and a dictionary mapping relation name to a list containing the names
     of fields on the related model which should be included.
 
-    `column_names` is either ``None`` or a list of strings. If it is ``None``,
-    the returned pair will be ``(None, None)``.
+    `column_names` must be a list of strings.
 
     If the name of a relation appears as a key in the dictionary, then it will
     not appear in the list.
 
     """
-    if column_names is None:
-        return None, None
     dotted_names, columns = partition(column_names, lambda name: '.' in name)
     # Create a dictionary mapping relation names to fields on the related
     # model.
@@ -314,15 +350,12 @@ def _parse_excludes(column_names):
     left and a dictionary mapping relation name to a list containing the names
     of fields on the related model which should be excluded.
 
-    `column_names` is either ``None`` or a list of strings. If it is ``None``,
-    the returned pair will be ``(None, None)``.
+    `column_names` must be a list of strings.
 
     If the name of a relation appears in the list then it will not appear in
     the dictionary.
 
     """
-    if column_names is None:
-        return None, None
     dotted_names, columns = partition(column_names, lambda name: '.' in name)
     # Create a dictionary mapping relation names to fields on the related
     # model.
@@ -572,10 +605,16 @@ class API(ModelView):
 
         """
         super(API, self).__init__(session, model, *args, **kw)
-        self.exclude_columns, self.exclude_relations = \
-            _parse_excludes(exclude_columns)
-        self.include_columns, self.include_relations = \
-            _parse_includes(include_columns)
+        if exclude_columns is None:
+            self.exclude_columns, self.exclude_relations = (None, None)
+        else:
+            self.exclude_columns, self.exclude_relations = _parse_excludes(
+                [self._get_column_name(column) for column in exclude_columns])
+        if include_columns is None:
+            self.include_columns, self.include_relations = (None, None)
+        else:
+            self.include_columns, self.include_relations = _parse_includes(
+                [self._get_column_name(column) for column in include_columns])
         self.include_methods = include_methods
         self.validation_exceptions = tuple(validation_exceptions or ())
         self.results_per_page = results_per_page
@@ -602,6 +641,42 @@ class API(ModelView):
             self.postprocessors['PATCH_MANY'].append(postprocessor)
         for preprocessor in self.preprocessors['PUT_MANY']:
             self.preprocessors['PATCH_MANY'].append(preprocessor)
+
+        # HACK: We would like to use the :attr:`API.decorators` class attribute
+        # in order to decorate each view method with a decorator that catches
+        # database integrity errors. However, in order to rollback the session,
+        # we need to have a session object available to roll back. Therefore we
+        # need to manually decorate each of the view functions here.
+        decorate = lambda name, f: setattr(self, name, f(getattr(self, name)))
+        for method in ['get', 'post', 'patch', 'put', 'delete']:
+            decorate(method, catch_integrity_errors(self.session))
+
+    def _get_column_name(self, column):
+        """Retrieve a column name from a column attribute of SQLAlchemy
+        model class, or a string.
+
+        Raises `TypeError` when argument does not fall into either of those
+        options.
+
+        Raises `ValueError` if argument is a column attribute that belongs
+        to an incorrect model class.
+
+        """
+        if hasattr(column, '__clause_element__'):
+            clause_element = column.__clause_element__()
+            if not isinstance(clause_element, Column):
+                msg = ('Column must be a string or a column attribute'
+                       ' of SQLAlchemy ORM class')
+                raise TypeError(msg)
+            model = column.class_
+            if model is not self.model:
+                msg = ('Cannot specify column of model %s'
+                       ' while creating API for model %s' % (
+                        model.__name__, self.model.__name__))
+                raise ValueError(msg)
+            return clause_element.key
+
+        return column
 
     def _add_to_relation(self, query, relationname, toadd=None):
         """Adds a new or existing related model to each model specified by
@@ -1017,7 +1092,7 @@ class API(ModelView):
                                             self._compute_results_per_page())
             headers = dict(Link=linkstring)
         else:
-            primary_key = primary_key_name(result)
+            primary_key = self.primary_key or primary_key_name(result)
             result = to_dict(result, deep, exclude=self.exclude_columns,
                              exclude_relations=self.exclude_relations,
                              include=self.include_columns,
@@ -1091,9 +1166,11 @@ class API(ModelView):
         """Removes the specified instance of the model with the specified name
         from the database.
 
-        Since :http:method:`delete` is an idempotent method according to the
-        :rfc:`2616`, this method responds with :http:status:`204` regardless of
-        whether an object was deleted.
+        Although :http:method:`delete` is an idempotent method according to
+        :rfc:`2616`, idempotency only means that subsequent identical requests
+        cannot have additional side-effects. Since the response code is not a
+        side effect, this method responds with :http:status:`204` only if an
+        object is deleted, and with :http:status:`404` when nothing is deleted.
 
         If `relationname
 
@@ -1104,7 +1181,7 @@ class API(ModelView):
            Added the `relationname` keyword argument.
 
         """
-        is_deleted = False
+        was_deleted = False
         for preprocessor in self.preprocessors['DELETE']:
             preprocessor(instance_id=instid, relation_name=relationname,
                          relation_instance_id=relationinstid)
@@ -1122,13 +1199,14 @@ class API(ModelView):
                                        relationinstid)
             # Removes an object from the relation list.
             relation.remove(relation_instance)
+            was_deleted = len(self.session.dirty) > 0
         elif inst is not None:
             self.session.delete(inst)
-            self.session.commit()
-            is_deleted = True
+            was_deleted = len(self.session.deleted) > 0
+        self.session.commit()
         for postprocessor in self.postprocessors['DELETE']:
-            postprocessor(is_deleted=is_deleted)
-        return {}, 204
+            postprocessor(was_deleted=was_deleted)
+        return {}, 204 if was_deleted else 404
 
     def post(self):
         """Creates a new instance of a given model based on request data.
@@ -1166,20 +1244,20 @@ class API(ModelView):
             # HACK Requests made from Internet Explorer 8 or 9 don't have the
             # correct content type, so request.get_json() doesn't work.
             if is_msie:
-                params = json.loads(request.get_data()) or {}
+                data = json.loads(request.get_data()) or {}
             else:
-                params = request.get_json() or {}
+                data = request.get_json() or {}
         except (BadRequest, TypeError, ValueError, OverflowError) as exception:
             current_app.logger.exception(str(exception))
             return dict(message='Unable to decode data'), 400
 
         # apply any preprocessors to the POST arguments
         for preprocessor in self.preprocessors['POST']:
-            preprocessor(data=params)
+            preprocessor(data=data)
 
         # Check for any request parameter naming a column which does not exist
         # on the current model.
-        for field in params:
+        for field in data:
             if not has_field(self.model, field):
                 msg = "Model does not have field '{0}'".format(field)
                 return dict(message=msg), 400
@@ -1190,25 +1268,25 @@ class API(ModelView):
 
         # Looking for what we're going to set on the model right now
         colkeys = cols.keys()
-        paramkeys = params.keys()
+        paramkeys = data.keys()
         props = set(colkeys).intersection(paramkeys).difference(relations)
 
         # Special case: if there are any dates, convert the string form of the
         # date into an instance of the Python ``datetime`` object.
-        params = strings_to_dates(self.model, params)
+        data = strings_to_dates(self.model, data)
 
         try:
             # Instantiate the model with the parameters.
-            modelargs = dict([(i, params[i]) for i in props])
+            modelargs = dict([(i, data[i]) for i in props])
             instance = self.model(**modelargs)
 
             # Handling relations, a single level is allowed
             for col in set(relations).intersection(paramkeys):
                 submodel = get_related_model(self.model, col)
 
-                if type(params[col]) == list:
+                if type(data[col]) == list:
                     # model has several related objects
-                    for subparams in params[col]:
+                    for subparams in data[col]:
                         subinst = get_or_create(self.session, submodel,
                                                 subparams)
                         try:
@@ -1219,19 +1297,25 @@ class API(ModelView):
                 else:
                     # model has single related object
                     subinst = get_or_create(self.session, submodel,
-                                            params[col])
+                                            data[col])
                     setattr(instance, col, subinst)
 
             # add the created model to the session
             self.session.add(instance)
             self.session.commit()
+            # Get the dictionary representation of the new instance.
             result = self._inst_to_dict(instance)
-
-            primary_key = str(result[primary_key_name(instance)])
+            # Determine the value of the primary key for this instance and
+            # encode URL-encode it (in case it is a Unicode string).
+            pk_name = self.primary_key or primary_key_name(instance)
+            primary_key = result[pk_name]
+            try:
+                primary_key = str(primary_key)
+            except UnicodeEncodeError:
+                primary_key = url_quote_plus(primary_key.encode('utf-8'))
 
             # The URL at which a client can access the newly created instance
             # of the model.
-
             url = '{0}/{1}'.format(request.base_url, primary_key)
             # Provide that URL in the Location header in the response.
             headers = dict(Location=url)
@@ -1242,10 +1326,6 @@ class API(ModelView):
             return result, 201, headers
         except self.validation_exceptions as exception:
             return self._handle_validation_exception(exception)
-        except (DataError, IntegrityError, ProgrammingError) as exception:
-            self.session.rollback()
-            current_app.logger.exception(str(exception))
-            return dict(message=str(exception)), 400
 
     def patch(self, instid, relationname, relationinstid):
         """Updates the instance specified by ``instid`` of the named model, or
@@ -1325,12 +1405,17 @@ class API(ModelView):
                 return dict(message='Unable to construct query'), 400
         else:
             # create a SQLAlchemy Query which has exactly the specified row
-            query = query_by_primary_key(self.session, self.model, instid)
+            query = query_by_primary_key(self.session, self.model, instid,
+                                         self.primary_key)
             if query.count() == 0:
                 return {_STATUS: 404}, 404
             assert query.count() == 1, 'Multiple rows with same ID'
 
-        relations = self._update_relations(query, data)
+        try:
+            relations = self._update_relations(query, data)
+        except self.validation_exceptions as exception:
+            current_app.logger.exception(str(exception))
+            return self._handle_validation_exception(exception)
         field_list = frozenset(data) ^ relations
         data = dict((field, data[field]) for field in field_list)
 
@@ -1350,9 +1435,6 @@ class API(ModelView):
         except self.validation_exceptions as exception:
             current_app.logger.exception(str(exception))
             return self._handle_validation_exception(exception)
-        except (DataError, IntegrityError, ProgrammingError) as exception:
-            current_app.logger.exception(str(exception))
-            return dict(message=str(exception)), 400
 
         # Perform any necessary postprocessing.
         if patchmany:

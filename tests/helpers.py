@@ -8,6 +8,18 @@
     :license: GNU AGPLv3+ or BSD
 
 """
+import sys
+is_python_version_2 = sys.version_info[0] == 2
+
+if is_python_version_2:
+    import types
+
+    def isclass(obj):
+        return isinstance(obj, (types.TypeType, types.ClassType))
+else:
+    def isclass(obj):
+        return isinstance(obj, type)
+
 import datetime
 import uuid
 
@@ -18,10 +30,12 @@ from sqlalchemy import Column
 from sqlalchemy import create_engine
 from sqlalchemy import Date
 from sqlalchemy import DateTime
+from sqlalchemy import event
 from sqlalchemy import Float
 from sqlalchemy import ForeignKey
 from sqlalchemy import Integer
 from sqlalchemy import Interval
+from sqlalchemy import select
 from sqlalchemy import Time
 from sqlalchemy import Unicode
 from sqlalchemy.dialects.postgresql import UUID
@@ -31,9 +45,15 @@ from sqlalchemy.orm import backref
 from sqlalchemy.orm import relationship
 from sqlalchemy.orm import scoped_session
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm.session import Session as SessionBase
 from sqlalchemy.types import CHAR
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.ext.associationproxy import association_proxy
+
+try:
+    from flask.ext import sqlalchemy as flask_sa
+except ImportError:
+    flask_sa = None
 
 
 from flask.ext.restless import APIManager
@@ -50,16 +70,42 @@ def skip_unless(condition, reason=None):
     def skip(test):
         message = 'Skipped {0}: {1}'.format(test.__name__, reason)
 
-        # TODO Since we don't check the case in which `test` is a class, the
-        # result of running the tests will be a single skipped test, although
-        # it should show one skip for each test method within the class.
+        if isclass(test):
+            for attr, val in test.__dict__.items():
+                if callable(val) and not attr.startswith('__'):
+                    setattr(test, attr, skip(val))
+            return test
+
         def inner(*args, **kw):
             if not condition:
                 raise SkipTest(message)
             return test(*args, **kw)
         inner.__name__ = test.__name__
         return inner
+
     return skip
+
+
+def unregister_fsa_session_signals():
+    """
+    When Flask-SQLAlchemy object is created, it registers some
+    session signal handlers.
+
+    In case of using both default SQLAlchemy session and Flask-SQLAlchemy
+    session (thats happening in tests), we need to unregister this handlers or
+    there will be some exceptions during test executions like:
+        AttributeError: 'Session' object has no attribute '_model_changes'
+
+    """
+    if not flask_sa:
+        return
+
+    event.remove(SessionBase, 'before_commit',
+                 flask_sa._SessionSignalEvents.session_signal_before_commit)
+    event.remove(SessionBase, 'after_commit',
+                 flask_sa._SessionSignalEvents.session_signal_after_commit)
+    event.remove(SessionBase, 'after_rollback',
+                 flask_sa._SessionSignalEvents.session_signal_after_rollback)
 
 
 # This code adapted from
@@ -200,10 +246,25 @@ class TestSupport(DatabaseTestBase):
             owner_id = Column(Integer, ForeignKey('person.id'))
             owner = relationship('Person')
             programs = relationship('ComputerProgram',
-                                    cascade="all, delete-orphan")
+                                    cascade="all, delete-orphan",
+                                    backref='computer')
 
             def speed(self):
                 return 42
+
+        class Screen(self.Base):
+            __tablename__ = 'screen'
+            id = Column(Integer, primary_key=True)
+            width = Column(Integer, nullable=False)
+            height = Column(Integer, nullable=False)
+
+            @hybrid_property
+            def number_of_pixels(self):
+                return self.width * self.height
+
+            @number_of_pixels.setter
+            def number_of_pixels(self, value):
+                self.height = value / self.width
 
         class Person(self.Base):
             __tablename__ = 'person'
@@ -219,6 +280,17 @@ class TestSupport(DatabaseTestBase):
                 if getattr(self, 'age') is None:
                     return None
                 return self.age < 18
+
+            @hybrid_property
+            def is_above_21(self):
+                if getattr(self, 'age') is None:
+                    return None
+                return self.age > 21
+
+            @is_above_21.expression
+            def is_above_21(cls):
+                return select([cls.age > 21]).as_scalar()
+
 
             def name_and_age(self):
                 return "{0} (aged {1:d})".format(self.name, self.age)
@@ -309,6 +381,7 @@ class TestSupport(DatabaseTestBase):
         self.CarModel = CarModel
         self.Project = Project
         self.Proof = Proof
+        self.Screen = Screen
 
         # create all the tables required for the models
         self.Base.metadata.create_all()

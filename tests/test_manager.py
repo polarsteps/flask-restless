@@ -9,7 +9,6 @@
 
 """
 import datetime
-import math
 
 from flask import json
 try:
@@ -22,14 +21,10 @@ else:
 from flask.ext.restless import APIManager
 from flask.ext.restless.helpers import get_columns
 
-from sqlalchemy import Column
-from sqlalchemy import func
-from sqlalchemy import Unicode
-from sqlalchemy.ext.hybrid import hybrid_property
-
 from .helpers import FlaskTestBase
 from .helpers import skip_unless
 from .helpers import TestSupport
+from .helpers import unregister_fsa_session_signals
 
 
 dumps = json.dumps
@@ -210,6 +205,25 @@ class TestAPIManager(TestSupport):
         response = self.app.get('/api2/person/{0}'.format(person.id))
         assert 'computers' not in loads(response.data)
 
+    def test_include_column_attributes(self):
+        """Test for specifying included columns as SQLAlchemy column attributes.
+
+        """
+        date = datetime.date(1999, 12, 31)
+        person = self.Person(name=u'Test', age=10, other=20, birth_date=date)
+        self.session.add(person)
+        self.session.commit()
+
+        include = frozenset([self.Person.name, self.Person.age])
+        self.manager.create_api(self.Person, include_columns=include)
+
+        response = self.app.get('/api/person/{0}'.format(person.id))
+        person_dict = loads(response.data)
+        for column in 'name', 'age':
+            assert column in person_dict
+        for column in 'id', 'other', 'birth_date':
+            assert column not in person_dict
+
     def test_exclude_related(self):
         """Test for specifying excluded columns on related models."""
         date = datetime.date(1999, 12, 31)
@@ -240,6 +254,25 @@ class TestAPIManager(TestSupport):
             assert column not in person_dict['computers'][0]
         for column in 'vendor', 'owner_id', 'buy_date':
             assert column in person_dict['computers'][0]
+
+    def test_exclude_column_attributes(self):
+        """Test for specifying excluded columns as SQLAlchemy column attributes.
+
+        """
+        date = datetime.date(1999, 12, 31)
+        person = self.Person(name=u'Test', age=10, other=20, birth_date=date)
+        self.session.add(person)
+        self.session.commit()
+
+        exclude = frozenset([self.Person.name, self.Person.age])
+        self.manager.create_api(self.Person, exclude_columns=exclude)
+
+        response = self.app.get('/api/person/{0}'.format(person.id))
+        person_dict = loads(response.data)
+        for column in 'name', 'age':
+            assert column not in person_dict
+        for column in 'id', 'other', 'birth_date':
+            assert column in person_dict
 
     def test_include_columns(self):
         """Tests that the `include_columns` argument specifies which columns to
@@ -524,67 +557,30 @@ class TestAPIManager(TestSupport):
         assert 1 == len(data['objects'])
         assert 'foo' == data['objects'][0]['name']
 
-    def test_set_hybrid_property(self):
-        """Set a hybrid property"""
-
-        class HybridPerson(self.Person):
-
-            @hybrid_property
-            def abs_other(self):
-                return self.other is not None and abs(self.other) or 0
-
-            @abs_other.expression
-            def abs_other(self):
-                return func.sum(HybridPerson.other)
-
-            @abs_other.setter
-            def abs_other(self, v):
-                self.other = v
-
-            @hybrid_property
-            def sq_other(self):
-                if not isinstance(self.other, float):
-                    return None
-
-                return self.other ** 2
-
-            @sq_other.setter
-            def sq_other(self, v):
-                self.other = math.sqrt(v)
-
-        self.manager.create_api(HybridPerson, methods=['POST', 'PATCH'])
-        response = self.app.post('/api/person', data=dumps({'abs_other': 1}))
-        assert 201 == response.status_code
-        data = loads(response.data)
-        assert 1 == data['other']
-        assert 1 == data['abs_other']
-
-        response = self.app.post('/api/person',
-                                 data=dumps({'name': u'Rodriguez'}))
-        assert 201 == response.status_code
-        response = self.app.patch('/api/person/2', data=dumps({'sq_other': 4}))
-        assert 200 == response.status_code
-        data = loads(response.data)
-        assert 2 == data['other']
-        assert 4 == data['sq_other']
-
     def test_universal_preprocessor(self):
         """Tests universal preprocessor and postprocessor applied to all
         methods created with the API manager.
 
         """
         class Counter(object):
-            def __init__(s): s.count = 0
-            def increment(s): s.count += 1
+            def __init__(s):
+                s.count = 0
+
+            def increment(s):
+                s.count += 1
+
             def __eq__(s, o):
                 return s.count == o.count if isinstance(o, Counter) \
                     else s.count == o
         precount = Counter()
         postcount = Counter()
+
         def preget(**kw):
             precount.increment()
+
         def postget(**kw):
             postcount.increment()
+
         manager = APIManager(self.flaskapp, self.session,
                              preprocessors=dict(GET_MANY=[preget]),
                              postprocessors=dict(GET_MANY=[postget]))
@@ -644,6 +640,7 @@ class TestFSA(FlaskTestBase):
     def tearDown(self):
         """Drops all tables from the temporary database."""
         self.db.drop_all()
+        unregister_fsa_session_signals()
 
     def test_flask_sqlalchemy(self):
         """Tests that :class:`flask.ext.restless.APIManager` correctly exposes

@@ -77,8 +77,11 @@ def session_query(session, model):
     """
     if hasattr(model, 'query'):
         if callable(model.query):
-            return model.query()
-        return model.query
+            query = model.query()
+        else:
+            query = model.query
+        if hasattr(query, 'filter'):
+            return query
     return session.query(model)
 
 
@@ -119,12 +122,13 @@ def get_related_model(model, relationname):
     whose name is `relationname`.
 
     """
-    cols = model._sa_class_manager
-    attr = getattr(model, relationname)
-    if relationname in cols and isinstance(attr.property, RelProperty):
-        return cols[relationname].property.mapper.class_
-    if isinstance(attr, AssociationProxy):
-        return get_related_association_proxy_model(attr)
+    if hasattr(model, relationname):
+        attr = getattr(model, relationname)
+        if hasattr(attr, 'property') \
+                and isinstance(attr.property, RelProperty):
+            return attr.property.mapper.class_
+        if isinstance(attr, AssociationProxy):
+            return get_related_association_proxy_model(attr)
     return None
 
 
@@ -143,12 +147,14 @@ def get_related_association_proxy_model(attr):
 
 
 def has_field(model, fieldname):
-    """Returns ``True`` if the `model` has the specified field, and it is not
-    a hybrid property.
+    """Returns ``True`` if the `model` has the specified field
+    or if it has a settable hybrid property for this field name.
 
     """
-    return (hasattr(model, fieldname) and
-            not isinstance(getattr(model, fieldname), _BinaryExpression))
+    descriptors_data = sqlalchemy_inspect(model).all_orm_descriptors._data
+    if fieldname in descriptors_data and hasattr(descriptors_data[fieldname], 'fset'):
+        return getattr(descriptors_data[fieldname], 'fset') is not None
+    return hasattr(model, fieldname)
 
 
 def get_field_type(model, fieldname):
@@ -235,6 +241,10 @@ def is_like_list(instance, relation):
     """
     if relation in instance._sa_class_manager:
         return instance._sa_class_manager[relation].property.uselist
+    elif hasattr(instance, relation):
+        attr = getattr(instance._sa_instance_state.class_, relation)
+        if hasattr(attr, 'property'):
+            return attr.property.uselist
     related_value = getattr(type(instance), relation, None)
     if isinstance(related_value, AssociationProxy):
         local_prop = related_value.local_attr.prop
@@ -306,7 +316,8 @@ def to_dict(instance, deep=None, exclude=None, include=None,
         column_attrs = inspected_instance.column_attrs.keys()
         descriptors = inspected_instance.all_orm_descriptors.items()
         hybrid_columns = [k for k, d in descriptors
-                          if d.extension_type == hybrid.HYBRID_PROPERTY]
+                          if d.extension_type == hybrid.HYBRID_PROPERTY
+                          and not (deep and k in deep)]
         columns = column_attrs + hybrid_columns
     except NoInspectionAvailable:
         return instance
@@ -562,8 +573,8 @@ def count(session, query):
     queries.
 
     """
-    num_results = None
-    if len(query.statement._froms) == 1:
-        counts = query.statement.with_only_columns([func.count()])
-        num_results = session.execute(counts.order_by(None)).scalar()
-    return query.count() if num_results is None else num_results
+    counts = query.selectable.with_only_columns([func.count()])
+    num_results = session.execute(counts.order_by(None)).scalar()
+    if num_results is None or query._limit:
+        return query.count()
+    return num_results
