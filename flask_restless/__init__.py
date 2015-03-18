@@ -7,7 +7,8 @@
     which have been described using `SQLAlchemy <http://sqlalchemy.org>`_.
 
     :copyright:2011 by Lincoln de Sousa <lincoln@comum.org>
-    :copyright:2012 Jeffrey Finkelstein <jeffrey.finkelstein@gmail.com>
+    :copyright: 2012, 2013, 2014, 2015 Jeffrey Finkelstein
+                <jeffrey.finkelstein@gmail.com> and contributors.
     :license: GNU AGPLv3+ or BSD
 
 """
@@ -16,8 +17,10 @@
 #:
 #: This should be the same as the version specified in the :file:`setup.py`
 #: file.
-__version__ = '0.15.1-dev'
+__version__ = '0.17.1-dev'
 
 # make the following names available as part of the public API
+from .helpers import url_for
 from .manager import APIManager
+from .manager import IllegalArgumentError
 from .views import ProcessingException

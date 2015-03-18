@@ -4,7 +4,8 @@
 
     Provides helper functions for unit tests in this package.
 
-    :copyright: 2012 Jeffrey Finkelstein <jeffrey.finkelstein@gmail.com>
+    :copyright: 2012, 2013, 2014, 2015 Jeffrey Finkelstein
+                <jeffrey.finkelstein@gmail.com> and contributors.
     :license: GNU AGPLv3+ or BSD
 
 """
@@ -21,6 +22,7 @@ else:
         return isinstance(obj, type)
 
 import datetime
+import functools
 import uuid
 
 from flask import Flask
@@ -66,6 +68,8 @@ def skip_unless(condition, reason=None):
     ``nose``. The argument ``reason`` is a string describing why the test was
     skipped.
 
+    This decorator can be applied to functions, methods, or classes.
+
     """
     def skip(test):
         message = 'Skipped {0}: {1}'.format(test.__name__, reason)
@@ -76,11 +80,11 @@ def skip_unless(condition, reason=None):
                     setattr(test, attr, skip(val))
             return test
 
+        @functools.wraps(test)
         def inner(*args, **kw):
             if not condition:
                 raise SkipTest(message)
             return test(*args, **kw)
-        inner.__name__ = test.__name__
         return inner
 
     return skip
@@ -106,6 +110,26 @@ def unregister_fsa_session_signals():
                  flask_sa._SessionSignalEvents.session_signal_after_commit)
     event.remove(SessionBase, 'after_rollback',
                  flask_sa._SessionSignalEvents.session_signal_after_rollback)
+
+
+def force_json_contenttype(test_client):
+    """Ensures that all requests made by the specified Flask test client have
+    the ``Content-Type`` header set to ``application/json``, unless another
+    content type is explicitly specified.
+
+    """
+    for methodname in ('get', 'put', 'patch', 'post', 'delete'):
+        # Create a decorator for the test client request methods that adds
+        # a JSON Content-Type by default if none is specified.
+        def set_content_type(func):
+            def new_func(*args, **kw):
+                if 'content_type' not in kw:
+                    kw['content_type'] = 'application/json'
+                return func(*args, **kw)
+            return new_func
+        # Decorate the original test client request method.
+        old_method = getattr(test_client, methodname)
+        setattr(test_client, methodname, set_content_type(old_method))
 
 
 # This code adapted from
@@ -154,48 +178,34 @@ class FlaskTestBase(object):
         app.config['DEBUG'] = True
         app.config['TESTING'] = True
         app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite://'
+        # This is required by `manager.url_for()` in order to construct
+        # absolute URLs.
+        app.config['SERVER_NAME'] = 'localhost'
         app.logger.disabled = True
         self.flaskapp = app
 
         # create the test client
         self.app = app.test_client()
 
-        # Ensure that all requests have Content-Type set to "application/json"
-        # unless otherwise specified.
-        for methodname in ('get', 'put', 'patch', 'post', 'delete'):
-            # Create a decorator for the test client request methods that adds
-            # a JSON Content-Type by default if none is specified.
-            def set_content_type(func):
-                def new_func(*args, **kw):
-                    if 'content_type' not in kw:
-                        kw['content_type'] = 'application/json'
-                    return func(*args, **kw)
-                return new_func
-            # Decorate the original test client request method.
-            old_method = getattr(self.app, methodname)
-            setattr(self.app, methodname, set_content_type(old_method))
+        force_json_contenttype(self.app)
 
 
 class DatabaseTestBase(FlaskTestBase):
-    """Base class for tests which use a database and have an
-    :class:`flask_restless.APIManager`.
+    """Base class for tests that use a SQLAlchemy database.
 
     The :meth:`setUp` method does the necessary SQLAlchemy initialization, and
     the subclasses should populate the database with models and then create the
     database (by calling ``self.Base.metadata.create_all()``).
 
-    The :class:`flask_restless.APIManager` is accessible at ``self.manager``.
-
     """
 
     def setUp(self):
         """Initializes the components necessary for models in a SQLAlchemy
-        database, as well as for Flask-Restless.
+        database.
 
         """
         super(DatabaseTestBase, self).setUp()
-
-        # initialize SQLAlchemy and Flask-Restless
+        # initialize SQLAlchemy
         app = self.flaskapp
         engine = create_engine(app.config['SQLALCHEMY_DATABASE_URI'],
                                convert_unicode=True)
@@ -204,11 +214,25 @@ class DatabaseTestBase(FlaskTestBase):
         self.session = scoped_session(self.Session)
         self.Base = declarative_base()
         self.Base.metadata.bind = engine
-        #Base.query = self.session.query_property()
-        self.manager = APIManager(app, self.session)
 
 
-class TestSupport(DatabaseTestBase):
+class ManagerTestBase(DatabaseTestBase):
+    """Base class for tests that use a SQLAlchemy database and an
+    :class:`flask_restless.APIManager`.
+
+    The :class:`flask_restless.APIManager` is accessible at ``self.manager``.
+
+    """
+
+    def setUp(self):
+        """Initializes an instance of :class:`flask.ext.restless.APIManager`.
+
+        """
+        super(ManagerTestBase, self).setUp()
+        self.manager = APIManager(self.flaskapp, session=self.session)
+
+
+class TestSupport(ManagerTestBase):
     """Base class for test cases which use a database with some basic models.
 
     """
@@ -252,6 +276,10 @@ class TestSupport(DatabaseTestBase):
             def speed(self):
                 return 42
 
+            @property
+            def speed_property(self):
+                return self.speed()
+
         class Screen(self.Base):
             __tablename__ = 'screen'
             id = Column(Integer, primary_key=True)
@@ -290,7 +318,6 @@ class TestSupport(DatabaseTestBase):
             @is_above_21.expression
             def is_above_21(cls):
                 return select([cls.age > 21]).as_scalar()
-
 
             def name_and_age(self):
                 return "{0} (aged {1:d})".format(self.name, self.age)
@@ -356,12 +383,13 @@ class TestSupport(DatabaseTestBase):
             id = Column(Integer, primary_key=True)
             person_id = Column(Integer, ForeignKey('person.id'))
             person = relationship('Person',
-                                 backref=backref('projects', lazy='dynamic'))
+                                  backref=backref('projects', lazy='dynamic'))
 
         class Proof(self.Base):
             __tablename__ = 'proof'
             id = Column(Integer, primary_key=True)
-            project = relationship('Project', backref=backref('proofs', lazy='dynamic'))
+            project = relationship('Project', backref=backref('proofs',
+                                                              lazy='dynamic'))
             project_id = Column(Integer, ForeignKey('project.id'))
             person = association_proxy('project', 'person')
             person_id = association_proxy('project', 'person_id')
@@ -388,7 +416,6 @@ class TestSupport(DatabaseTestBase):
 
     def tearDown(self):
         """Drops all tables from the temporary database."""
-        #self.session.remove()
         self.Base.metadata.drop_all()
 
 

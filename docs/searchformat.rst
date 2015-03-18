@@ -96,13 +96,9 @@ mappings, all of which are optional:
   The returned list of matching instances will include only those instances
   that satisfy all of the given filters.
 
-``disjunction``
-  A Boolean that specifies whether the list of filters should be treated as a
-  disjunction or a conjunction. If this is ``true``, the response will include
-  all instances of the model that match *any* of the filters. If this is
-  ``false`` the response will include all instances of the model that match
-  *all* of the filters. This will be treated as ``false`` if not specified by
-  the client (in other words, the default is conjunction).
+  Filter objects can also be arbitrary Boolean formulas. For example::
+
+      {"or": [<filterobject>, {"and": [<filterobject>, ...]}, ...]}
 
 ``limit`` 
   A positive integer which specifies the maximum number of objects to return.
@@ -120,6 +116,22 @@ mappings, all of which are optional:
   requested model and ``<directionname>`` is either ``"asc"`` for ascending
   order or ``"desc"`` for descending order.
 
+  ``<fieldname>`` may alternately specify a field on a related model, if it is
+  a string of the form ``<relationname>__<fieldname>``.
+
+``group_by``
+  A list of objects of the form::
+
+      {"field": <fieldname>}
+
+  where ``<fieldname>`` is a string corresponding to the name of a field of the
+  requested model.
+
+  ``<fieldname>`` may alternately specify a field on a related model, if it is
+  a string of the form ``<relationname>__<fieldname>``.
+
+  .. versionadded:: 0.16.0
+
 ``single``
   A Boolean representing whether a single result is expected as a result of the
   search. If this is ``true`` and either no results or multiple results meet
@@ -127,6 +139,10 @@ mappings, all of which are optional:
 
 If a filter is poorly formatted (for example, ``op`` is set to ``'=='`` but
 ``val`` is not set), the server responds with :http:statuscode:`400`.
+
+.. versionchanged:: 0.17.0
+   Removed the ``disjunction`` mapping in favor of a more robust Boolean
+   expression system.
 
 .. _operators:
 
@@ -141,12 +157,21 @@ The operator strings recognized by the API incude:
 * ``>=``, ``ge``, ``gte``, ``geq``, ``<=``, ``le``, ``lte``, ``leq``
 * ``in``, ``not_in``
 * ``is_null``, ``is_not_null``
-* ``like``
+* ``like``, ``ilike``
 * ``has``
 * ``any``
 
 These correspond to SQLAlchemy column operators as defined `here
 <http://docs.sqlalchemy.org/en/latest/core/expression_api.html#sqlalchemy.sql.operators.ColumnOperators>`_.
+
+.. warning::
+
+   If you use a percent sign in the argument to the ``like`` operator (for
+   example, ``%somestring%``), make sure it is `URL encoded`_, otherwise the
+   server may interpret the first few characters of that argument as a
+   percent-encoded character when attempting to decode the URL.
+
+   .. _URL encoded: https://en.wikipedia.org/wiki/Percent-encoding#Percent-encoding_the_percent_character
 
 Examples
 --------
@@ -184,14 +209,14 @@ attribute greater than or equal to 10:
      ]
    }
 
-Disjunction of filters
-~~~~~~~~~~~~~~~~~~~~~~
+Arbitrary Boolean expression of filters
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 On request:
 
 .. sourcecode:: http
 
-   GET /api/person?q={"filters":[{"name":"age","op":"lt","val":10},{"name":"age","op":"gt","val":20}],"disjunction":true} HTTP/1.1
+   GET /api/person?q={"filters":[{"or":[{"name":"age","op":"lt","val":10},{"name":"age","op":"gt","val":20}]}]} HTTP/1.1
    Host: example.com
 
 the response will include only those ``Person`` instances that have ``age``
@@ -356,6 +381,15 @@ response will include only those ``Person`` instances that are related to any
 Using ``has`` and ``any``
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
+Use the ``has`` and ``any`` operators to search for instances by fields on
+related instances. For example, you can search for all ``Person`` instances
+that have a related ``Computer`` with a certain ID number by using the ``any``
+operator. For another example, you can search for all ``Computer`` instances
+that have an owner with a certain name by using the ``has`` operator. In
+general, use the ``any`` operator if the relation is a list of objects and use
+the ``has`` operator if the relation is a single object. For more information,
+see the SQLAlchemy documentation.
+
 On request:
 
 .. sourcecode:: http
@@ -378,5 +412,30 @@ the response will include only those ``Person`` instances that have a related
      [
        {"id": 1, "name": "John", "age": 80, "height": 65, "computers": [...]},
        {"id": 2, "name": "Mary", "age": 73, "height": 60, "computers": [...]}
+     ]
+   }
+
+On request:
+
+.. sourcecode:: http
+
+   GET /api/computers?q={"filters":[{"name":"owner","op":"has","val":{"name":"vendor","op":"ilike","val":"%John%"}}]} HTTP/1.1
+   Host: example.com
+
+the response will include only those ``Computer`` instances that have an owner
+with ``name`` field that includes ``'John'``:
+
+.. sourcecode:: http
+
+   HTTP/1.1 200 OK
+
+   {
+     "num_results": 6,
+     "total_pages": 3,
+     "page": 2,
+     "objects":
+     [
+       {"id": 1, "name": "pluto", vendor="Apple", ...},
+       {"id": 2, "name": "jupiter", vendor="Dell", ...}
      ]
    }

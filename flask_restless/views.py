@@ -17,7 +17,8 @@
       evaluating some function on the entire collection of a given model.
 
     :copyright: 2011 by Lincoln de Sousa <lincoln@comum.org>
-    :copyright: 2012 Jeffrey Finkelstein <jeffrey.finkelstein@gmail.com>
+    :copyright: 2012, 2013, 2014, 2015 Jeffrey Finkelstein
+                <jeffrey.finkelstein@gmail.com> and contributors.
     :license: GNU AGPLv3+ or BSD
 
 """
@@ -34,14 +35,16 @@ from flask import jsonify as _jsonify
 from flask import request
 from flask.views import MethodView
 from mimerender import FlaskMimeRender
+from sqlalchemy import Column
 from sqlalchemy.exc import DataError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.ext.associationproxy import AssociationProxy
+from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.orm.exc import MultipleResultsFound
 from sqlalchemy.orm.exc import NoResultFound
 from sqlalchemy.orm.query import Query
-from sqlalchemy.sql.schema import Column
 from werkzeug.exceptions import BadRequest
 from werkzeug.exceptions import HTTPException
 from werkzeug.urls import url_quote_plus
@@ -62,6 +65,7 @@ from .helpers import session_query
 from .helpers import strings_to_dates
 from .helpers import to_dict
 from .helpers import upper_keys
+from .helpers import get_related_association_proxy_model
 from .search import create_query
 from .search import search
 
@@ -87,16 +91,24 @@ class ProcessingException(HTTPException):
     preprocessing or postprocessing halts, so any processors appearing later in
     the list will not be invoked.
 
-    `status_code` is the HTTP status code of the response supplied to the
-    client in the case that this exception is raised. `message` is an error
-    message describing the cause of this exception. This message will appear in
-    the JSON object in the body of the response to the client.
+    `code` is the HTTP status code of the response supplied to the client in
+    the case that this exception is raised. `description` is an error message
+    describing the cause of this exception. This message will appear in the
+    JSON object in the body of the response to the client.
 
     """
     def __init__(self, description='', code=400, *args, **kwargs):
         super(ProcessingException, self).__init__(*args, **kwargs)
         self.code = code
         self.description = description
+
+
+class ValidationError(Exception):
+    """Raised when there is a problem deserializing a dictionary into an
+    instance of a SQLAlchemy model.
+
+    """
+    pass
 
 
 def _is_msie8or9():
@@ -175,6 +187,7 @@ def catch_integrity_errors(session):
         def wrapped(*args, **kw):
             try:
                 return func(*args, **kw)
+            # TODO should `sqlalchemy.exc.InvalidRequestError`s also be caught?
             except (DataError, IntegrityError, ProgrammingError) as exception:
                 session.rollback()
                 current_app.logger.exception(str(exception))
@@ -372,6 +385,39 @@ def _parse_excludes(column_names):
             del relations[column]
     return columns, relations
 
+
+def extract_error_messages(exception):
+    """Tries to extract a dictionary mapping field name to validation error
+    messages from `exception`, which is a validation exception as provided in
+    the ``validation_exceptions`` keyword argument in the constructor of this
+    class.
+
+    Since the type of the exception is provided by the user in the constructor
+    of this class, we don't know for sure where the validation error messages
+    live inside `exception`. Therefore this method simply attempts to access a
+    few likely attributes and returns the first one it finds (or ``None`` if no
+    error messages dictionary can be extracted).
+
+    """
+    # 'errors' comes from sqlalchemy_elixir_validations
+    if hasattr(exception, 'errors'):
+        return exception.errors
+    # 'message' comes from savalidation
+    if hasattr(exception, 'message'):
+        # TODO this works only if there is one validation error
+        try:
+            left, right = str(exception).rsplit(':', 1)
+            left_bracket = left.rindex('[')
+            right_bracket = right.rindex(']')
+        except ValueError as exc:
+            current_app.logger.exception(str(exc))
+            # could not parse the string; we're not trying too hard here...
+            return None
+        msg = right[:right_bracket].strip(' "')
+        fieldname = left[left_bracket + 1:].strip()
+        return {fieldname: msg}
+    return None
+
 #: Creates the mimerender object necessary for decorating responses with a
 #: function that automatically formats the dictionary in the appropriate format
 #: based on the ``Accept`` header.
@@ -484,7 +530,7 @@ class API(ModelView):
                  validation_exceptions=None, results_per_page=10,
                  max_results_per_page=100, post_form_preprocessor=None,
                  preprocessors=None, postprocessors=None, primary_key=None,
-                 *args, **kw):
+                 serializer=None, deserializer=None, *args, **kw):
         """Instantiates this view with the specified attributes.
 
         `session` is the SQLAlchemy session in which all database transactions
@@ -570,6 +616,17 @@ class API(ModelView):
         value for this. If `model` has two or more primary keys, you must
         specify which one to use.
 
+        `serializer` and `deserializer` are custom serialization functions. The
+        former function must take a single argument representing the instance
+        of the model to serialize, and must return a dictionary representation
+        of that instance. The latter function must take a single argument
+        representing the dictionary representation of an instance of the model
+        and must return an instance of `model` that has those attributes. For
+        more information, see :ref:`serialization`.
+
+        .. versionadded:: 0.17.0
+           Added the `serializer` and `deserializer` keyword arguments.
+
         .. versionadded:: 0.13.0
            Added the `primary_key` keyword argument.
 
@@ -620,6 +677,18 @@ class API(ModelView):
         self.results_per_page = results_per_page
         self.max_results_per_page = max_results_per_page
         self.primary_key = primary_key
+        # Use our default serializer and deserializer if none are specified.
+        if serializer is None:
+            self.serialize = self._inst_to_dict
+        else:
+            self.serialize = serializer
+        if deserializer is None:
+            self.deserialize = self._dict_to_inst
+            # And check for our own default ValidationErrors here
+            self.validation_exceptions = tuple(list(self.validation_exceptions)
+                                               + [ValidationError])
+        else:
+            self.deserialize = deserializer
         self.postprocessors = defaultdict(list)
         self.preprocessors = defaultdict(list)
         self.postprocessors.update(upper_keys(postprocessors or {}))
@@ -670,9 +739,9 @@ class API(ModelView):
                 raise TypeError(msg)
             model = column.class_
             if model is not self.model:
-                msg = ('Cannot specify column of model %s'
-                       ' while creating API for model %s' % (
-                        model.__name__, self.model.__name__))
+                msg = ('Cannot specify column of model {0} while creating API'
+                       ' for model {1}').format(model.__name__,
+                                                self.model.__name__)
                 raise ValueError(msg)
             return clause_element.key
 
@@ -845,41 +914,9 @@ class API(ModelView):
 
         """
         self.session.rollback()
-        errors = self._extract_error_messages(exception) or \
+        errors = extract_error_messages(exception) or \
             'Could not determine specific validation errors'
         return dict(validation_errors=errors), 400
-
-    def _extract_error_messages(self, exception):
-        """Tries to extract a dictionary mapping field name to validation error
-        messages from `exception`, which is a validation exception as provided
-        in the ``validation_exceptions`` keyword argument in the constructor of
-        this class.
-
-        Since the type of the exception is provided by the user in the
-        constructor of this class, we don't know for sure where the validation
-        error messages live inside `exception`. Therefore this method simply
-        attempts to access a few likely attributes and returns the first one it
-        finds (or ``None`` if no error messages dictionary can be extracted).
-
-        """
-        # 'errors' comes from sqlalchemy_elixir_validations
-        if hasattr(exception, 'errors'):
-            return exception.errors
-        # 'message' comes from savalidation
-        if hasattr(exception, 'message'):
-            # TODO this works only if there is one validation error
-            try:
-                left, right = str(exception).rsplit(':', 1)
-                left_bracket = left.rindex('[')
-                right_bracket = right.rindex(']')
-            except ValueError as exception:
-                current_app.logger.exception(str(exception))
-                # could not parse the string; we're not trying too hard here...
-                return None
-            msg = right[:right_bracket].strip(' "')
-            fieldname = left[left_bracket + 1:].strip()
-            return {fieldname: msg}
-        return None
 
     def _compute_results_per_page(self):
         """Helper function which returns the number of results per page based
@@ -967,6 +1004,54 @@ class API(ModelView):
                        include=self.include_columns,
                        include_relations=self.include_relations,
                        include_methods=self.include_methods)
+
+    def _dict_to_inst(self, data):
+        """Returns an instance of the model with the specified attributes."""
+        # Check for any request parameter naming a column which does not exist
+        # on the current model.
+        for field in data:
+            if not has_field(self.model, field):
+                msg = "Model does not have field '{0}'".format(field)
+                raise ValidationError(msg)
+
+        # Getting the list of relations that will be added later
+        cols = get_columns(self.model)
+        relations = get_relations(self.model)
+
+        # Looking for what we're going to set on the model right now
+        colkeys = cols.keys()
+        paramkeys = data.keys()
+        props = set(colkeys).intersection(paramkeys).difference(relations)
+
+        # Special case: if there are any dates, convert the string form of the
+        # date into an instance of the Python ``datetime`` object.
+        data = strings_to_dates(self.model, data)
+
+        # Instantiate the model with the parameters.
+        modelargs = dict([(i, data[i]) for i in props])
+        instance = self.model(**modelargs)
+
+        # Handling relations, a single level is allowed
+        for col in set(relations).intersection(paramkeys):
+            submodel = get_related_model(self.model, col)
+
+            if type(data[col]) == list:
+                # model has several related objects
+                for subparams in data[col]:
+                    subinst = get_or_create(self.session, submodel,
+                                            subparams)
+                    try:
+                        getattr(instance, col).append(subinst)
+                    except AttributeError:
+                        attribute = getattr(instance, col)
+                        attribute[subinst.key] = subinst.value
+            else:
+                # model has single related object
+                subinst = get_or_create(self.session, submodel,
+                                        data[col])
+                setattr(instance, col, subinst)
+
+        return instance
 
     def _instid_to_dict(self, instid):
         """Returns the dictionary representation of the instance specified by
@@ -1058,6 +1143,30 @@ class API(ModelView):
         for preprocessor in self.preprocessors['GET_MANY']:
             preprocessor(search_params=search_params)
 
+        # resolve date-strings as required by the model
+        for param in search_params.get('filters', list()):
+            if 'name' in param and 'val' in param:
+                query_model = self.model
+                query_field = param['name']
+                if '__' in param['name']:
+                    fieldname, relation = param['name'].split('__')
+                    submodel = getattr(self.model, fieldname)
+                    if isinstance(submodel, InstrumentedAttribute):
+                        query_model = submodel.property.mapper.class_
+                        query_field = relation
+                    elif isinstance(submodel, AssociationProxy):
+                        # For the sake of brevity, rename this function.
+                        get_assoc = get_related_association_proxy_model
+                        query_model = get_assoc(submodel)
+                        query_field = relation
+                to_convert = {query_field: param['val']}
+                try:
+                    result = strings_to_dates(query_model, to_convert)
+                except ValueError as exception:
+                    current_app.logger.exception(str(exception))
+                    return dict(message='Unable to construct query'), 400
+                param['val'] = result.get(query_field)
+
         # perform a filtered search
         try:
             result = search(self.session, self.model, search_params)
@@ -1129,7 +1238,16 @@ class API(ModelView):
         if instid is None:
             return self._search()
         for preprocessor in self.preprocessors['GET_SINGLE']:
-            preprocessor(instance_id=instid)
+            temp_result = preprocessor(instance_id=instid)
+            # Let the return value of the preprocessor be the new value of
+            # instid, thereby allowing the preprocessor to effectively specify
+            # which instance of the model to process on.
+            #
+            # We assume that if the preprocessor returns None, it really just
+            # didn't return anything, which means we shouldn't overwrite the
+            # instid.
+            if temp_result is not None:
+                instid = temp_result
         # get the instance of the "main" model whose ID is instid
         instance = get_by(self.session, self.model, instid, self.primary_key)
         if instance is None:
@@ -1137,7 +1255,7 @@ class API(ModelView):
         # If no relation is requested, just return the instance. Otherwise,
         # get the value of the relation specified by `relationname`.
         if relationname is None:
-            result = self._inst_to_dict(instance)
+            result = self.serialize(instance)
         else:
             related_value = getattr(instance, relationname)
             # create a placeholder for the relations of the returned models
@@ -1162,6 +1280,65 @@ class API(ModelView):
             postprocessor(result=result)
         return result
 
+    def _delete_many(self):
+        """Deletes multiple instances of the model.
+
+        If search parameters are provided via the ``q`` query parameter, only
+        those instances matching the search parameters will be deleted.
+
+        If no instances were deleted, this returns a
+        :http:status:`404`. Otherwise, it returns a :http:status:`200` with the
+        number of deleted instances in the body of the response.
+
+        """
+        # try to get search query from the request query parameters
+        try:
+            search_params = json.loads(request.args.get('q', '{}'))
+        except (TypeError, ValueError, OverflowError) as exception:
+            current_app.logger.exception(str(exception))
+            return dict(message='Unable to decode search query'), 400
+
+        for preprocessor in self.preprocessors['DELETE_MANY']:
+            preprocessor(search_params=search_params)
+
+        # perform a filtered search
+        try:
+            # HACK We need to ignore any ``order_by`` request from the client,
+            # because for some reason, SQLAlchemy does not allow calling
+            # delete() on a query that has an ``order_by()`` on it. If you
+            # attempt to call delete(), you get this error:
+            #
+            #     sqlalchemy.exc.InvalidRequestError: Can't call Query.delete()
+            #     when order_by() has been called
+            #
+            result = search(self.session, self.model, search_params,
+                            _ignore_order_by=True)
+        except NoResultFound:
+            return dict(message='No result found'), 404
+        except MultipleResultsFound:
+            return dict(message='Multiple results found'), 400
+        except Exception as exception:
+            current_app.logger.exception(str(exception))
+            return dict(message='Unable to construct query'), 400
+
+        # for security purposes, don't transmit list as top-level JSON
+        if isinstance(result, Query):
+            # Implementation note: `synchronize_session=False`, described in
+            # the SQLAlchemy documentation for
+            # :meth:`sqlalchemy.orm.query.Query.delete`, states that this is
+            # the most efficient option for bulk deletion, and is reliable once
+            # the session has expired, which occurs after the session commit
+            # below.
+            num_deleted = result.delete(synchronize_session=False)
+        else:
+            self.session.delete(result)
+            num_deleted = 1
+        self.session.commit()
+        result = dict(num_deleted=num_deleted)
+        for postprocessor in self.postprocessors['DELETE_MANY']:
+            postprocessor(result=result, search_params=search_params)
+        return (result, 200) if num_deleted > 0 else 404
+
     def delete(self, instid, relationname, relationinstid):
         """Removes the specified instance of the model with the specified name
         from the database.
@@ -1181,10 +1358,19 @@ class API(ModelView):
            Added the `relationname` keyword argument.
 
         """
+        if instid is None:
+            # If no instance ID is provided, this request is an attempt to
+            # delete many instances of the model via a search with possible
+            # filters.
+            return self._delete_many()
         was_deleted = False
-        for preprocessor in self.preprocessors['DELETE']:
-            preprocessor(instance_id=instid, relation_name=relationname,
-                         relation_instance_id=relationinstid)
+        for preprocessor in self.preprocessors['DELETE_SINGLE']:
+            temp_result = preprocessor(instance_id=instid,
+                                       relation_name=relationname,
+                                       relation_instance_id=relationinstid)
+            # See the note under the preprocessor in the get() method.
+            if temp_result is not None:
+                instid = temp_result
         inst = get_by(self.session, self.model, instid, self.primary_key)
         if relationname:
             # If the request is ``DELETE /api/person/1/computers``, error 400.
@@ -1204,7 +1390,7 @@ class API(ModelView):
             self.session.delete(inst)
             was_deleted = len(self.session.deleted) > 0
         self.session.commit()
-        for postprocessor in self.postprocessors['DELETE']:
+        for postprocessor in self.postprocessors['DELETE_SINGLE']:
             postprocessor(was_deleted=was_deleted)
         return {}, 204 if was_deleted else 404
 
@@ -1255,77 +1441,34 @@ class API(ModelView):
         for preprocessor in self.preprocessors['POST']:
             preprocessor(data=data)
 
-        # Check for any request parameter naming a column which does not exist
-        # on the current model.
-        for field in data:
-            if not has_field(self.model, field):
-                msg = "Model does not have field '{0}'".format(field)
-                return dict(message=msg), 400
-
-        # Getting the list of relations that will be added later
-        cols = get_columns(self.model)
-        relations = get_relations(self.model)
-
-        # Looking for what we're going to set on the model right now
-        colkeys = cols.keys()
-        paramkeys = data.keys()
-        props = set(colkeys).intersection(paramkeys).difference(relations)
-
-        # Special case: if there are any dates, convert the string form of the
-        # date into an instance of the Python ``datetime`` object.
-        data = strings_to_dates(self.model, data)
-
         try:
-            # Instantiate the model with the parameters.
-            modelargs = dict([(i, data[i]) for i in props])
-            instance = self.model(**modelargs)
-
-            # Handling relations, a single level is allowed
-            for col in set(relations).intersection(paramkeys):
-                submodel = get_related_model(self.model, col)
-
-                if type(data[col]) == list:
-                    # model has several related objects
-                    for subparams in data[col]:
-                        subinst = get_or_create(self.session, submodel,
-                                                subparams)
-                        try:
-                            getattr(instance, col).append(subinst)
-                        except AttributeError:
-                            attribute = getattr(instance, col)
-                            attribute[subinst.key] = subinst.value
-                else:
-                    # model has single related object
-                    subinst = get_or_create(self.session, submodel,
-                                            data[col])
-                    setattr(instance, col, subinst)
-
-            # add the created model to the session
+            # Convert the dictionary representation into an instance of the
+            # model.
+            instance = self.deserialize(data)
+            # Add the created model to the session.
             self.session.add(instance)
             self.session.commit()
-            # Get the dictionary representation of the new instance.
-            result = self._inst_to_dict(instance)
-            # Determine the value of the primary key for this instance and
-            # encode URL-encode it (in case it is a Unicode string).
-            pk_name = self.primary_key or primary_key_name(instance)
-            primary_key = result[pk_name]
-            try:
-                primary_key = str(primary_key)
-            except UnicodeEncodeError:
-                primary_key = url_quote_plus(primary_key.encode('utf-8'))
-
-            # The URL at which a client can access the newly created instance
-            # of the model.
-            url = '{0}/{1}'.format(request.base_url, primary_key)
-            # Provide that URL in the Location header in the response.
-            headers = dict(Location=url)
-
-            for postprocessor in self.postprocessors['POST']:
-                postprocessor(result=result)
-
-            return result, 201, headers
+            # Get the dictionary representation of the new instance as it
+            # appears in the database.
+            result = self.serialize(instance)
         except self.validation_exceptions as exception:
             return self._handle_validation_exception(exception)
+        # Determine the value of the primary key for this instance and
+        # encode URL-encode it (in case it is a Unicode string).
+        pk_name = self.primary_key or primary_key_name(instance)
+        primary_key = result[pk_name]
+        try:
+            primary_key = str(primary_key)
+        except UnicodeEncodeError:
+            primary_key = url_quote_plus(primary_key.encode('utf-8'))
+        # The URL at which a client can access the newly created instance
+        # of the model.
+        url = '{0}/{1}'.format(request.base_url, primary_key)
+        # Provide that URL in the Location header in the response.
+        headers = dict(Location=url)
+        for postprocessor in self.postprocessors['POST']:
+            postprocessor(result=result)
+        return result, 201, headers
 
     def patch(self, instid, relationname, relationinstid):
         """Updates the instance specified by ``instid`` of the named model, or
@@ -1387,7 +1530,10 @@ class API(ModelView):
                 preprocessor(search_params=search_params, data=data)
         else:
             for preprocessor in self.preprocessors['PATCH_SINGLE']:
-                preprocessor(instance_id=instid, data=data)
+                temp_result = preprocessor(instance_id=instid, data=data)
+                # See the note under the preprocessor in the get() method.
+                if temp_result is not None:
+                    instid = temp_result
 
         # Check for any request parameter naming a column which does not exist
         # on the current model.

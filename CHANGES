@@ -15,13 +15,54 @@ Numbers following a pound sign (#) refer to `GitHub issues
    As of version 0.6, Flask-Restless supports both pure SQLAlchemy and
    Flask-SQLAlchemy models. Before that, it supported only Elixir models.
 
-Version 0.15.1-dev
+Version 0.17.1-dev
 ------------------
 
 Not yet released.
 
+- Increases minimum version requirement for ``python-dateutil`` to be strictly
+  greater than 2.2 to avoid parsing bug.
+- #331, #415: documents the importance of URL encoding when using the ``like``
+  operator to filter results.
+
+Version 0.17.0
+--------------
+
+Released on February 17, 2015.
+
+- Corrects bug to allow delayed initialization of multiple Flask applications.
+- #167: allows custom serialization/deserialization functions.
+- #198: allows arbitrary Boolean expressions in search query filters.
+- #226: allows creating APIs before initializing the Flask application object.
+- #274: adds the :func:`url_for` function for computing URLs from models.
+- #379: improves datetime parsing in search requests.
+- #398: fixes bug where DELETE_SINGLE processors were not actually used.
+- #400: disallows excluding a primary key on a :http:method:`POST` request.
+
+Version 0.16.0
+--------------
+
+Released on February 3, 2015.
+
+- #237: allows bulk delete of model instances via the ``allow_delete_many``
+  keyword argument.
+- #313, #389: :meth:`APIManager.init_app` now can be correctly used to
+  initialize multiple Flask applications.
+- #327, #391: allows ordering searches by fields on related instances.
+- #353: allows search queries to specify ``group_by`` directives.
+- #365: allows preprocessors to specify return values on :http:method:`get`
+  requests.
+- #385: makes the `include_methods` keywords argument respect model properties.
+
+Version 0.15.1
+--------------
+
+Released on January 2, 2015.
+
 - #367: catch :exc:`IntegrityError`, :exc:`DataError`, and
   :exc:`ProgrammingError` exceptions in all view methods.
+- #374: import :class:`sqlalchemy.Column` from :mod:`sqlalchemy` directly,
+  instead of :mod:`sqlalchemy.sql.schema`
 
 Version 0.15.0
 --------------

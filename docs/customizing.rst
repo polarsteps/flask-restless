@@ -42,6 +42,16 @@ with data respond with serialized JSON strings.
 
    Deletes the person with the given ``id`` and returns :http:statuscode:`204`.
 
+.. http:delete:: /api/person
+
+   This is only available if the ``allow_delete_many`` keyword argument is set
+   to ``True`` when calling the :meth:`~APIManager.create_api` method. For more
+   information, see :ref:`allowmany`.
+
+   Deletes all instances of ``Person`` that match the search query provided in
+   the ``q`` URL query paremeter. For more information on search parameters,
+   see :ref:`searchformat`.
+
 .. http:post:: /api/person
 
    Creates a new person in the database and returns its ``id``. The initial
@@ -59,7 +69,7 @@ with data respond with serialized JSON strings.
 
    This is only available if the ``allow_patch_many`` keyword argument is set
    to ``True`` when calling the :meth:`~APIManager.create_api` method. For more
-   information, see :ref:`allowpatchmany`.
+   information, see :ref:`allowmany`.
 
    Updates the attributes of all ``Person`` instances. The attributes are read
    as JSON from the body of the request. For information about the format of
@@ -81,14 +91,19 @@ argument::
 
 Then your API for ``Person`` will be available at ``/api/v2/person``.
 
+.. _collectionname:
+
 Collection name
 ~~~~~~~~~~~~~~~
 
 By default, the name of the collection which appears in the URLs of the API
-will be the name of the table which backs your model. If your model is a
-SQLAlchemy model, this will be the value of ``__tablename__``. If your model is
-a Flask-SQLAlchemy model, this will be the lowercase name of the model with
-``CamelCase`` changed to ``camel_case``.
+will be the name of the table that backs your model. If your model is a
+SQLAlchemy model, this will be the value of its ``__tablename__`` attribute. If
+your model is a Flask-SQLAlchemy model, this will be the lowercase name of the
+model with camel case changed to all-lowercase with underscore separators. For
+example, a class named ``MyModel`` implies a collection name of
+``'my_model'``. Furthermore, the URL at which this collection is accessible by
+default is ``/api/my_model``.
 
 To provide a different name for the model, provide a string to the
 `collection_name` keyword argument of the :meth:`APIManager.create_api`
@@ -109,10 +124,10 @@ If your model has more than one primary key (one called ``id`` and one called
 If you do this, Flask-Restless will create URLs like ``/api/user/myusername``
 instead of ``/api/user/137``.
 
-.. _allowpatchmany:
+.. _allowmany:
 
-Enable patching all instances
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Enable bulk patching or deleting
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 By default, a :http:patch:`/api/person` request (note the missing ID) will
 cause a :http:statuscode:`405` response. By setting the ``allow_patch_many``
@@ -121,6 +136,70 @@ keyword argument of the :meth:`APIManager.create_api` method to be ``True``,
 instances of ``Person``::
 
     apimanager.create_api(Person, methods=['PATCH'], allow_patch_many=True)
+
+If search parameters are provided via the ``q`` query parameter as described in
+:ref:`searchformat`, only those instances matching the search will be patched.
+
+Similarly, to allow bulk deletions, set the ``allow_delete_many`` keyword
+argument to be ``True``.
+
+.. _serialization:
+
+Custom serialization
+~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 0.17.0
+
+Flask-Restless provides very basic object serialization and deserialization. If
+you wish to have more control over the way instances of your models are
+converted to Python dictionary representations, you can specify a custom
+serialization function by providing it to :meth:`APIManager.create_api` via the
+``serializer`` keyword argument. Similarly, to provide a deserialization
+function that converts a Python dictionary representation to an instance of
+your model, use the ``deserializer`` keyword argument.
+
+The serialization function must take a single argument representing the
+instance of the model to serialize, and must return a dictionary representation
+of that instance. The deserialization function must take a single argument
+representing the dictionary representation of an instance of the model and must
+return an instance of `model` that has those attributes.
+
+.. note::
+
+   We **strongly suggest** using a Python object serialization library instead
+   of writing your own serialization functions. This is also likely a better
+   approach than specifying which columns to include or exclude
+   (:ref:`includes`) or preprocessors and postprocessors (:ref:`processors`).
+
+For example, if you create schema for your database models using `Marshmallow
+<https://marshmallow.readthedocs.org>`_), then you use that library's built-in
+serialization functions as follows::
+
+    class PersonSchema(Schema):
+        id = fields.Integer()
+        name = fields.String()
+
+        def make_object(self, data):
+            print('MAKING OBJECT FROM', data)
+            return Person(**data)
+
+    person_schema = PersonSchema()
+
+    def person_serializer(instance):
+        return person_schema.dump(instance).data
+
+    def person_deserializer(data):
+        return person_schema.load(data).data
+
+    manager = APIManager(app, session=session)
+    manager.create_api(Person, methods=['GET', 'POST'],
+                       serializer=person_serializer,
+                       deserializer=person_deserializer)
+
+For a complete version of this example, see the
+:file:`examples/server_configurations/custom_serialization.py` module in the
+source distribution, or view it online at `GitHub
+<https://github.com/jfinkels/flask-restless/tree/master/examples/server_configurations/custom_serialization.py>`__.
 
 .. _validation:
 
@@ -184,6 +263,14 @@ For information about the request and response formats for this endpoint, see
 
 Specifying which columns are provided in responses
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. warning::
+
+   The include/exclude system described in this section is very simplistic; a
+   much better way to specify which columns are included in your responses is
+   to use a Python object serialization library and specify custom
+   serialization and deserialization functions as described in
+   :ref:`serialization`.
 
 By default, all columns of your model will be exposed by the API. If the
 ``include_columns`` keyword argument is an iterable of strings, *only* columns
@@ -378,15 +465,15 @@ example::
 As introduced in the above example, the dictionary keys for the `preprocessors`
 and `postprocessors` can be one of the following strings:
 
+* ``'POST'`` for requests to post a new instance of the model.
 * ``'GET_SINGLE'`` for requests to get a single instance of the model.
-* ``'GET_MANY'`` for requests to get the entire collection of instances of the
-  model.
+* ``'GET_MANY'`` for requests to get multiple instances of the model.
 * ``'PATCH_SINGLE'`` or ``'PUT_SINGLE'`` for requests to patch a single
   instance of the model.
-* ``'PATCH_MANY'`` or ``'PUT_MANY'`` for requests to patch the entire
-  collection of instances of the model.
-* ``'POST'`` for requests to post a new instance of the model.
-* ``'DELETE'`` for requests to delete an instance of the model.
+* ``'PATCH_MANY'`` or ``'PUT_MANY'`` for requests to patch multiple instances
+  of the model.
+* ``'DELETE_SINGLE'`` for requests to delete an instance of the model.
+* ``'DELETE_MANY'`` for requests to delete multiple instances of the model.
 
 .. note::
 
@@ -397,12 +484,22 @@ and `postprocessors` can be one of the following strings:
    :http:method:`patch` method.
 
 The preprocessors and postprocessors for each type of request accept different
-arguments, but none of them has a return value (more specifically, any returned
-value is ignored). Those preprocessors and postprocessors that accept
-dictionaries as parameters can (and should) modify their arguments
-*in-place*. That means the changes made to, for example, the ``result``
-dictionary will be seen by the Flask-Restless view functions and ultimately
-returned to the client.
+arguments. Most of them should have no return value (more specifically, any
+returned value is ignored). The return value from each of the ``GET_SINGLE``,
+``PATCH_SINGLE``, and ``DELETE_SINGLE`` preprocessors is interpreted as a value
+with which to replace ``instance_id``, the variable containing the value of the
+primary key of the requested instance of the model. For example, if a request
+for :http:get:`/api/person/1` encounters a preprocessor (for ``GET_SINGLE``)
+that returns the integer ``8``, Flask-Restless will continue to process the
+request as if it had received :http:get:`/api/person/8`. (If multiple
+preprocessors are specified for a single HTTP method and each one has a return
+value, Flask-Restless will only remember the value returned by the last
+preprocessor function.)
+
+Those preprocessors and postprocessors that accept dictionaries as parameters
+can (and should) modify their arguments *in-place*. That means the changes made
+to, for example, the ``result`` dictionary will be seen by the Flask-Restless
+view functions and ultimately returned to the client.
 
 The arguments to the preprocessor and postprocessor functions will be provided
 as keyword arguments, so you should always add ``**kw`` as the final argument
@@ -410,6 +507,9 @@ when defining a preprocessor or postprocessor function. This way, you can
 specify only the keyword arguments you need when defining your
 functions. Furthermore, if a new version of Flask-Restless changes the API,
 you can update Flask-Restless without breaking your code.
+
+.. versionchanged:: 0.16.0
+   Replaced ``DELETE`` with ``DELETE_MANY`` and ``DELETE_SINGLE``.
 
 .. versionadded:: 0.13.0
    Functions provided as postprocessors for ``GET_MANY`` and ``PATCH_MANY``
@@ -506,9 +606,10 @@ you can update Flask-Restless without breaking your code.
           """
           pass
 
-* :http:method:`delete`::
 
-      def delete_preprocessor(instance_id=None, **kw):
+* :http:method:`delete` for a single instance::
+
+      def delete_single_preprocessor(instance_id=None, **kw):
           """Accepts a single argument, `instance_id`, which is the primary key
           of the instance which will be deleted.
 
@@ -518,6 +619,25 @@ you can update Flask-Restless without breaking your code.
       def delete_postprocessor(was_deleted=None, **kw):
           """Accepts a single argument, `was_deleted`, which represents whether
           the instance has been deleted.
+
+          """
+          pass
+
+  and for the collection::
+
+      def delete_many_preprocessor(search_params=None, **kw):
+          """Accepts a single argument, `search_params`, which is a dictionary
+          containing the search parameters for the request.
+
+          """
+          pass
+
+      def delete_many_postprocessor(result=None, search_params=None, **kw):
+          """Accepts two arguments: `result`, which is the dictionary
+          representation of which is the dictionary representation of the JSON
+          response which will be returned to the client, and `search_params`,
+          which is a dictionary containing the search parameters for the
+          request.
 
           """
           pass
@@ -683,7 +803,7 @@ For a more complete example using `Flask-Login
 <packages.python.org/Flask-Login/>`_, see the
 :file:`examples/server_configurations/authentication` directory in the source
 distribution, or view it online at `GitHub
-<https://github.com/jfinkels/flask-restless/tree/master/examples/server_configurations/authentication>`_.
+<https://github.com/jfinkels/flask-restless/tree/master/examples/server_configurations/authentication>`__.
 
 Enabling Cross-Origin Resource Sharing (CORS)
 ---------------------------------------------

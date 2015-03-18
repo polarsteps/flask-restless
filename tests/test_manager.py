@@ -4,12 +4,14 @@
 
     Provides unit tests for the :mod:`flask_restless.manager` module.
 
-    :copyright: 2012 Jeffrey Finkelstein <jeffrey.finkelstein@gmail.com>
+    :copyright: 2012, 2013, 2014, 2015 Jeffrey Finkelstein
+                <jeffrey.finkelstein@gmail.com> and contributors.
     :license: GNU AGPLv3+ or BSD
 
 """
 import datetime
 
+from flask import Flask
 from flask import json
 try:
     from flask.ext.sqlalchemy import SQLAlchemy
@@ -17,11 +19,19 @@ except:
     has_flask_sqlalchemy = False
 else:
     has_flask_sqlalchemy = True
+from nose.tools import raises
+from sqlalchemy import Column
+from sqlalchemy import Integer
 
 from flask.ext.restless import APIManager
+from flask.ext.restless import url_for
+from flask.ext.restless import IllegalArgumentError
+from flask.ext.restless.helpers import to_dict
 from flask.ext.restless.helpers import get_columns
 
+from .helpers import DatabaseTestBase
 from .helpers import FlaskTestBase
+from .helpers import force_json_contenttype
 from .helpers import skip_unless
 from .helpers import TestSupport
 from .helpers import unregister_fsa_session_signals
@@ -31,10 +41,152 @@ dumps = json.dumps
 loads = json.loads
 
 
-class TestAPIManager(TestSupport):
-    """Unit tests for the :class:`flask_restless.manager.APIManager` class.
+class TestLocalAPIManager(DatabaseTestBase):
+    """Provides tests for :class:`flask.ext.restless.APIManager` when the tests
+    require that the instance of :class:`flask.ext.restless.APIManager` has not
+    yet been instantiated.
 
     """
+    def setUp(self):
+        super(TestLocalAPIManager, self).setUp()
+
+        class Person(self.Base):
+            __tablename__ = 'person'
+            id = Column(Integer, primary_key=True)
+
+        class Computer(self.Base):
+            __tablename__ = 'computer'
+            id = Column(Integer, primary_key=True)
+
+        self.Person = Person
+        self.Computer = Computer
+        self.Base.metadata.create_all()
+
+    def test_url_for(self):
+        manager = APIManager(self.flaskapp, session=self.session)
+        manager.create_api(self.Person, collection_name='people')
+        manager.create_api(self.Computer, collection_name='computers')
+        with self.flaskapp.app_context():
+            url = url_for(self.Computer)
+            assert url.endswith('/api/computers')
+            assert url_for(self.Person).endswith('/api/people')
+            assert url_for(self.Person, instid=1).endswith('/api/people/1')
+            url = url_for(self.Person, instid=1, relationname='computers')
+            assert url.endswith('/api/people/1/computers')
+            url = url_for(self.Person, instid=1, relationname='computers',
+                          relationinstid=2)
+            assert url.endswith('/api/people/1/computers/2')
+
+    def test_init_app(self):
+        """Tests for initializing the Flask application after instantiating the
+        :class:`flask.ext.restless.APIManager` object.
+
+        """
+        manager = APIManager()
+        manager.init_app(self.flaskapp, session=self.session)
+        manager.create_api(self.Person, app=self.flaskapp)
+        response = self.app.get('/api/person')
+        assert response.status_code == 200
+
+    def test_init_app_split_initialization(self):
+        manager = APIManager(session=self.session)
+        manager.init_app(self.flaskapp)
+        manager.create_api(self.Person, app=self.flaskapp)
+        response = self.app.get('/api/person')
+        assert response.status_code == 200
+
+    def test_init_multiple(self):
+        manager = APIManager(session=self.session)
+        flaskapp1 = self.flaskapp
+        flaskapp2 = Flask(__name__)
+        testclient1 = self.app
+        testclient2 = flaskapp2.test_client()
+        force_json_contenttype(testclient2)
+        manager.init_app(flaskapp1)
+        manager.init_app(flaskapp2)
+        manager.create_api(self.Person, app=flaskapp1)
+        manager.create_api(self.Computer, app=flaskapp2)
+        response = testclient1.get('/api/person')
+        assert response.status_code == 200
+        response = testclient1.get('/api/computer')
+        assert response.status_code == 404
+        response = testclient2.get('/api/person')
+        assert response.status_code == 404
+        response = testclient2.get('/api/computer')
+        assert response.status_code == 200
+
+    def test_creation_api_without_app_dependency(self):
+        """Tests that api can be added before app will be passed to manager."""
+        manager = APIManager()
+        manager.create_api(self.Person)
+        manager.init_app(self.flaskapp, self.session)
+        response = self.app.get('/api/person')
+        assert response.status_code == 200
+
+    def test_multiple_app_delayed_init(self):
+        manager = APIManager(session=self.session)
+
+        # Create the Flask applications and the test clients.
+        flaskapp1 = self.flaskapp
+        flaskapp2 = Flask(__name__)
+        testclient1 = self.app
+        testclient2 = flaskapp2.test_client()
+        force_json_contenttype(testclient2)
+
+        # First create the API, then initialize the Flask applications after.
+        manager.create_api(self.Person, app=flaskapp1)
+        manager.create_api(self.Computer, app=flaskapp2)
+        manager.init_app(flaskapp1)
+        manager.init_app(flaskapp2)
+
+        # Tests that only the first Flask application gets requests for
+        # /api/person and only the second gets requests for /api/computer.
+        response = testclient1.get('/api/person')
+        assert response.status_code == 200
+        response = testclient1.get('/api/computer')
+        assert response.status_code == 404
+        response = testclient2.get('/api/person')
+        assert response.status_code == 404
+        response = testclient2.get('/api/computer')
+        assert response.status_code == 200
+
+    def test_universal_preprocessor(self):
+        """Tests universal preprocessor and postprocessor applied to all
+        methods created with the API manager.
+
+        """
+        class Counter(object):
+            def __init__(s):
+                s.count = 0
+
+            def increment(s):
+                s.count += 1
+
+            def __eq__(s, o):
+                return s.count == o.count if isinstance(o, Counter) \
+                    else s.count == o
+        precount = Counter()
+        postcount = Counter()
+
+        def preget(**kw):
+            precount.increment()
+
+        def postget(**kw):
+            postcount.increment()
+
+        manager = APIManager(self.flaskapp, session=self.session,
+                             preprocessors=dict(GET_MANY=[preget]),
+                             postprocessors=dict(GET_MANY=[postget]))
+        manager.create_api(self.Person)
+        manager.create_api(self.Computer)
+        self.app.get('/api/person')
+        self.app.get('/api/computer')
+        self.app.get('/api/person')
+        assert precount == postcount == 3
+
+
+class TestAPIManager(TestSupport):
+    """Unit tests for the :class:`flask_restless.manager.APIManager` class."""
 
     def test_constructor(self):
         """Tests that no error occurs on instantiation without any arguments to
@@ -42,22 +194,6 @@ class TestAPIManager(TestSupport):
 
         """
         APIManager()
-
-    def test_init_app(self):
-        """Tests for initializing the Flask application after instantiating the
-        :class:`flask.ext.restless.APIManager` object.
-
-        """
-        # initialize the Flask application
-        self.manager.init_app(self.flaskapp, self.session)
-
-        # create an API
-        self.manager.create_api(self.Person)
-
-        # make a request on the API
-        #client = app.test_client()
-        response = self.app.get('/api/person')
-        assert response.status_code == 200
 
     def test_create_api(self):
         """Tests that the :meth:`flask_restless.manager.APIManager.create_api`
@@ -336,6 +472,10 @@ class TestAPIManager(TestSupport):
         self.manager.create_api(self.Computer, url_prefix='/included',
                                 include_methods=['owner.name_and_age'])
 
+        # included non-callable property
+        self.manager.create_api(self.Computer, url_prefix='/included_property',
+                                include_methods=['speed_property'])
+
         # create a test person
         date = datetime.date(1999, 12, 31)
         person = self.Person(name=u'Test', age=10, other=20, birth_date=date)
@@ -366,6 +506,12 @@ class TestAPIManager(TestSupport):
         response = self.app.get('/included/person')
         response_data = loads(response.data)
         assert response_data['objects'][0]['computers'][0]['speed'] == 42
+
+        # get one with included property
+        url = '/included_property/computer/{0}'.format(computer.id)
+        response = self.app.get(url)
+        response_data = loads(response.data)
+        assert response_data['speed_property'] == 42
 
     def test_included_method_returns_object(self):
         """Tests that objects are serialized when returned from a method listed
@@ -434,6 +580,15 @@ class TestAPIManager(TestSupport):
         response = self.app.get('/none/person/{0}'.format(personid))
         for column in 'name', 'age', 'other', 'birth_date', 'computers':
             assert column not in loads(response.data)
+
+    @raises(IllegalArgumentError)
+    def test_exclude_primary_key_column(self):
+        """Tests that trying to create a writable API while excluding the
+        primary key field raises an error.
+
+        """
+        self.manager.create_api(self.Person, exclude_columns=['id'],
+                                methods=['POST'])
 
     def test_different_urls(self):
         """Tests that establishing different URL endpoints for the same model
@@ -557,39 +712,41 @@ class TestAPIManager(TestSupport):
         assert 1 == len(data['objects'])
         assert 'foo' == data['objects'][0]['name']
 
-    def test_universal_preprocessor(self):
-        """Tests universal preprocessor and postprocessor applied to all
-        methods created with the API manager.
 
-        """
-        class Counter(object):
-            def __init__(s):
-                s.count = 0
+class TestSerialization(TestSupport):
 
-            def increment(s):
-                s.count += 1
+    def serializer(self, instance):
+        result = to_dict(instance)
+        # Add extra information.
+        result['foo'] = 'bar'
+        return result
 
-            def __eq__(s, o):
-                return s.count == o.count if isinstance(o, Counter) \
-                    else s.count == o
-        precount = Counter()
-        postcount = Counter()
+    def deserializer(self, data):
+        # Remove the extra information.
+        data.pop('foo')
+        instance = self.Person(**data)
+        return instance
 
-        def preget(**kw):
-            precount.increment()
+    def test_custom_serializer_get(self):
+        self.session.add(self.Person(id=1))
+        self.session.commit()
+        self.manager.create_api(self.Person, methods=['GET'],
+                                serializer=self.serializer)
+        response = self.app.get('/api/person/1')
+        assert response.status_code == 200
+        data = loads(response.data)
+        assert data['foo'] == 'bar'
 
-        def postget(**kw):
-            postcount.increment()
-
-        manager = APIManager(self.flaskapp, self.session,
-                             preprocessors=dict(GET_MANY=[preget]),
-                             postprocessors=dict(GET_MANY=[postget]))
-        manager.create_api(self.Person)
-        manager.create_api(self.Computer)
-        self.app.get('/api/person')
-        self.app.get('/api/computer')
-        self.app.get('/api/person')
-        assert precount == postcount == 3
+    def test_custom_serializer_post(self):
+        self.manager.create_api(self.Person, methods=['POST'],
+                                serializer=self.serializer,
+                                deserializer=self.deserializer)
+        # POST will deserialize once and serialize once
+        response = self.app.post('/api/person',
+                                 data=dumps(dict(id=1, foo='bar')))
+        assert response.status_code == 201
+        data = loads(response.data)
+        assert data['foo'] == 'bar'
 
 
 @skip_unless(has_flask_sqlalchemy, 'Flask-SQLAlchemy not found.')
@@ -608,7 +765,6 @@ class TestFSA(FlaskTestBase):
 
         # initialize SQLAlchemy and Flask-Restless
         self.db = SQLAlchemy(self.flaskapp)
-        self.manager = APIManager(self.flaskapp, flask_sqlalchemy_db=self.db)
 
         # for the sake of brevity...
         db = self.db
@@ -647,12 +803,13 @@ class TestFSA(FlaskTestBase):
         models defined using Flask-SQLAlchemy.
 
         """
+        manager = APIManager(self.flaskapp, flask_sqlalchemy_db=self.db)
+
         # create three different APIs for the same model
-        self.manager.create_api(self.Person, methods=['GET', 'POST'])
-        self.manager.create_api(self.Person, methods=['PATCH'],
-                                url_prefix='/api2')
-        self.manager.create_api(self.Person, methods=['GET'],
-                                url_prefix='/readonly')
+        manager.create_api(self.Person, methods=['GET', 'POST'])
+        manager.create_api(self.Person, methods=['PATCH'], url_prefix='/api2')
+        manager.create_api(self.Person, methods=['GET'],
+                           url_prefix='/readonly')
 
         # test that specified endpoints exist
         response = self.app.post('/api/person', data=dumps(dict(name='foo')))
@@ -674,3 +831,17 @@ class TestFSA(FlaskTestBase):
         assert len(loads(response.data)['objects']) == 1
         assert loads(response.data)['objects'][0]['id'] == 1
         assert loads(response.data)['objects'][0]['name'] == 'bar'
+
+    def test_init_app(self):
+        manager = APIManager()
+        manager.init_app(self.flaskapp, flask_sqlalchemy_db=self.db)
+        manager.create_api(self.Person, app=self.flaskapp)
+        response = self.app.get('/api/person')
+        assert response.status_code == 200
+
+    def test_init_app_split_initialization(self):
+        manager = APIManager(flask_sqlalchemy_db=self.db)
+        manager.init_app(self.flaskapp)
+        manager.create_api(self.Person, app=self.flaskapp)
+        response = self.app.get('/api/person')
+        assert response.status_code == 200

@@ -4,7 +4,8 @@
 
     Helper functions for Flask-Restless.
 
-    :copyright: 2012 Jeffrey Finkelstein <jeffrey.finkelstein@gmail.com>
+    :copyright: 2012, 2013, 2014, 2015 Jeffrey Finkelstein
+                <jeffrey.finkelstein@gmail.com> and contributors.
     :license: GNU AGPLv3+ or BSD
 
 """
@@ -27,7 +28,6 @@ from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.orm.attributes import QueryableAttribute
 from sqlalchemy.orm.query import Query
 from sqlalchemy.sql import func
-from sqlalchemy.sql.expression import _BinaryExpression
 from sqlalchemy.sql.expression import ColumnElement
 from sqlalchemy.inspection import inspect as sqlalchemy_inspect
 from types import MethodType
@@ -147,18 +147,19 @@ def get_related_association_proxy_model(attr):
 
 
 def has_field(model, fieldname):
-    """Returns ``True`` if the `model` has the specified field
-    or if it has a settable hybrid property for this field name.
+    """Returns ``True`` if the `model` has the specified field or if it has a
+    settable hybrid property for this field name.
 
     """
-    descriptors_data = sqlalchemy_inspect(model).all_orm_descriptors._data
-    if fieldname in descriptors_data and hasattr(descriptors_data[fieldname], 'fset'):
-        return getattr(descriptors_data[fieldname], 'fset') is not None
+    descriptors = sqlalchemy_inspect(model).all_orm_descriptors._data
+    if fieldname in descriptors and hasattr(descriptors[fieldname], 'fset'):
+        return descriptors[fieldname].fset is not None
     return hasattr(model, fieldname)
 
 
 def get_field_type(model, fieldname):
     """Helper which returns the SQLAlchemy type of the field.
+
     """
     field = getattr(model, fieldname)
     if isinstance(field, ColumnElement):
@@ -180,6 +181,7 @@ def is_date_field(model, fieldname):
     """Returns ``True`` if and only if the field of `model` with the specified
     name corresponds to either a :class:`datetime.date` object or a
     :class:`datetime.datetime` object.
+
     """
     fieldtype = get_field_type(model, fieldname)
     return isinstance(fieldtype, Date) or isinstance(fieldtype, DateTime)
@@ -188,6 +190,7 @@ def is_date_field(model, fieldname):
 def is_interval_field(model, fieldname):
     """Returns ``True`` if and only if the field of `model` with the specified
     name corresponds to a :class:`datetime.timedelta` object.
+
     """
     fieldtype = get_field_type(model, fieldname)
     return isinstance(fieldtype, Interval)
@@ -254,6 +257,10 @@ def is_like_list(instance, relation):
 
 
 def is_mapped_class(cls):
+    """Returns ``True`` if and only if the specified SQLAlchemy model class is
+    a mapped class.
+
+    """
     try:
         sqlalchemy_inspect(cls)
         return True
@@ -331,9 +338,13 @@ def to_dict(instance, deep=None, exclude=None, include=None,
                   if not (col.startswith('__') or col in COLUMN_BLACKLIST))
     # add any included methods
     if include_methods is not None:
-        result.update(dict((method, getattr(instance, method)())
-                           for method in include_methods
-                           if not '.' in method and type(getattr(instance, method)) == MethodType))
+        for method in include_methods:
+            if '.' not in method:
+                value = getattr(instance, method)
+                # Allow properties and static attributes in include_methods
+                if callable(value):
+                    value = value()
+                result[method] = value
     # Check for objects in the dictionary that may not be serializable by
     # default. Convert datetime objects to ISO 8601 format, convert UUID
     # objects to hexadecimal strings, etc.
@@ -556,7 +567,14 @@ def strings_to_dates(model, dictionary):
             elif value in CURRENT_TIME_MARKERS:
                 result[fieldname] = getattr(func, value.lower())()
             else:
-                result[fieldname] = parse_datetime(value)
+                value_as_datetime = parse_datetime(value)
+                result[fieldname] = value_as_datetime
+                # If the attribute on the model needs to be a Date object as
+                # opposed to a DateTime object, just get the date component of
+                # the datetime.
+                fieldtype = get_field_type(model, fieldname)
+                if isinstance(fieldtype, Date):
+                    result[fieldname] = value_as_datetime.date()
         elif (is_interval_field(model, fieldname) and value is not None
               and isinstance(value, int)):
             result[fieldname] = datetime.timedelta(seconds=value)
@@ -578,3 +596,93 @@ def count(session, query):
     if num_results is None or query._limit:
         return query.count()
     return num_results
+
+
+# This code comes from <http://stackoverflow.com/a/6798042/108197>, which is
+# licensed under the Creative Commons Attribution-ShareAlike License version
+# 3.0 Unported.
+#
+# That is an answer originally authored by the user
+# <http://stackoverflow.com/users/500584/agf> to the question
+# <http://stackoverflow.com/q/6760685/108197>.
+#
+# TODO This code is for simultaneous Python 2 and 3 usage. It can be greatly
+# simplified when removing Python 2 support.
+class _Singleton(type):
+    """A metaclass for a singleton class."""
+
+    #: The known instances of the class instantiating this metaclass.
+    _instances = {}
+
+    def __call__(cls, *args, **kwargs):
+        """Returns the singleton instance of the specified class."""
+        if cls not in cls._instances:
+            supercls = super(_Singleton, cls)
+            cls._instances[cls] = supercls.__call__(*args, **kwargs)
+        return cls._instances[cls]
+
+
+class Singleton(_Singleton('SingletonMeta', (object,), {})):
+    """Base class for a singleton class."""
+    pass
+
+
+class UrlFinder(Singleton):
+    """The singleton class that backs the :func:`url_for` function."""
+
+    def __init__(self):
+
+        #: A global list of created :class:`APIManager` objects.
+        self.created_managers = []
+
+    def __call__(self, model, instid=None, relationname=None,
+                 relationinstid=None, _apimanager=None, **kw):
+        if _apimanager is not None:
+            if model not in _apimanager.created_apis_for:
+                message = ('APIManager {0} has not created an API for model '
+                           ' {1}').format(_apimanager, model)
+                raise ValueError(message)
+            return _apimanager.url_for(model, instid=instid,
+                                       relationname=relationname,
+                                       relationinstid=relationinstid, **kw)
+        for manager in self.created_managers:
+            try:
+                return self(model, instid=instid, relationname=relationname,
+                            relationinstid=relationinstid,
+                            _apimanager=manager, **kw)
+            except ValueError:
+                pass
+        message = ('Model {0} is not known to any APIManager'
+                   ' objects').format(model)
+        raise ValueError(message)
+
+
+#: Returns the URL for the specified model, similar to :func:`flask.url_for`.
+#:
+#: `model` is a SQLAlchemy model class. This should be a model on which
+#: :meth:`APIManager.create_api_blueprint` (or :meth:`APIManager.create_api`)
+#: has been invoked previously. If no API has been created for it, this
+#: function raises a `ValueError`.
+#:
+#: If `_apimanager` is not ``None``, it must be an instance of
+#: :class:`APIManager`. Restrict our search for endpoints exposing `model` to
+#: only endpoints created by the specified :class:`APIManager` instance.
+#:
+#: `instid`, `relationname`, and `relationinstid` allow you to get a more
+#: specific sub-resource.
+#:
+#: For example, suppose you have a model class ``Person`` and have created the
+#: appropriate Flask application and SQLAlchemy session::
+#:
+#:     >>> manager = APIManager(app, session=session)
+#:     >>> manager.create_api(Person, collection_name='people')
+#:     >>> url_for(Person, instid=3)
+#:     'http://example.com/api/people/3'
+#:     >>> url_for(Person, instid=3, relationname=computers)
+#:     'http://example.com/api/people/3/computers'
+#:     >>> url_for(Person, instid=3, relationname=computers, relationinstid=9)
+#:     'http://example.com/api/people/3/computers/9'
+#:
+#: The remaining keyword arguments, `kw`, are passed directly on to
+#: :func:`flask.url_for`.
+url_for = UrlFinder()

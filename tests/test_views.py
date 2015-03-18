@@ -6,7 +6,8 @@
     Provides unit tests for the :mod:`flask_restless.views` module.
 
     :copyright: 2011 by Lincoln de Sousa <lincoln@comum.org>
-    :copyright: 2012, 2013 Jeffrey Finkelstein <jeffrey.finkelstein@gmail.com>
+    :copyright: 2012, 2013, 2014, 2015 Jeffrey Finkelstein
+                <jeffrey.finkelstein@gmail.com> and contributors.
     :license: GNU AGPLv3+ or BSD
 
 """
@@ -14,6 +15,12 @@ from datetime import date
 from datetime import datetime
 from datetime import timedelta
 import math
+# In Python 2, the function is `urllib.quote()`, in Python 3 it is
+# `urllib.parse.quote()`.
+try:
+    from urllib.parse import quote as urlquote
+except:
+    from urllib import quote as urlquote
 
 import dateutil
 from flask import json
@@ -39,8 +46,8 @@ from sqlalchemy.orm.collections import column_mapped_collection as col_mapped
 from flask.ext.restless.helpers import to_dict
 from flask.ext.restless.manager import APIManager
 
-from .helpers import DatabaseTestBase
 from .helpers import FlaskTestBase
+from .helpers import ManagerTestBase
 from .helpers import skip_unless
 from .helpers import TestSupport
 from .helpers import TestSupportPrefilled
@@ -688,7 +695,7 @@ class TestAPI(TestSupport):
 
         # This errors as expected
         response = self.app.patch('/api/person/1',
-                                 data=dumps({'name': u'Statler'}))
+                                  data=dumps({'name': u'Statler'}))
         assert response.status_code == 400
         assert json.loads(response.data)['message'] == 'IntegrityError'
         assert self.session.is_active, "Session is in `partial rollback` state"
@@ -718,6 +725,35 @@ class TestAPI(TestSupport):
         # Making sure it has been deleted
         people = self.session.query(self.Person).filter_by(id=1)
         assert people.count() == 0
+
+    def test_disallow_delete_many(self):
+        """Tests for deleting many instances of a collection by using a search
+        query to select instances to delete.
+
+        """
+        # Don't allow deleting many unless explicitly requested.
+        response = self.app.delete('/api/person')
+        assert response.status_code == 405
+
+    def test_delete_many(self):
+        """Tests for deleting many instances of a collection by using a search
+        query to select instances to delete.
+
+        """
+        # Recreate the API to allow delete many at /api2/person.
+        self.manager.create_api(self.Person, methods=['DELETE'],
+                                allow_delete_many=True, url_prefix='/api2')
+        person1 = self.Person(name=u'foo')
+        person2 = self.Person(name=u'bar')
+        person3 = self.Person(name=u'baz')
+        self.session.add_all([person1, person2, person3])
+        self.session.commit()
+
+        search = {'filters': [{'name': 'name', 'val': 'ba%', 'op': 'like'}]}
+        response = self.app.delete('/api2/person?q={0}'.format(dumps(search)))
+        assert response.status_code == 200
+        data = loads(response.data)
+        assert data['num_deleted'] == 2
 
     def test_delete_integrity_error(self):
         """Tests that an :exc:`IntegrityError` raised in a
@@ -806,7 +842,8 @@ class TestAPI(TestSupport):
         assert 201 == response.status_code
         response = self.app.patch('/api/person/1', data=dumps(dict(bogus=0)))
         assert 400 == response.status_code
-        response = self.app.patch('/api/person/1', data=dumps(dict(is_minor=True)))
+        response = self.app.patch('/api/person/1',
+                                  data=dumps(dict(is_minor=True)))
         assert 400 == response.status_code
 
     def test_patch_many(self):
@@ -1515,12 +1552,15 @@ class TestAPI(TestSupport):
         assert 4 == data['sq_other']
 
     def test_patch_with_hybrid_property(self):
-        """Tests that a hybrid property can be correctly posted from a client."""
+        """Tests that a hybrid property can be correctly posted from a client.
 
+        """
         self.session.add(self.Screen(id=1, width=5, height=4))
         self.session.commit()
-        self.manager.create_api(self.Screen, methods=['PATCH'], collection_name='screen')
-        response = self.app.patch('/api/screen/1', data=dumps({"number_of_pixels": 50}))
+        self.manager.create_api(self.Screen, methods=['PATCH'],
+                                collection_name='screen')
+        response = self.app.patch('/api/screen/1',
+                                  data=dumps({"number_of_pixels": 50}))
         assert 200 == response.status_code
         data = loads(response.data)
         assert 5 == data['width']
@@ -1732,8 +1772,6 @@ class TestSearch(TestSupportPrefilled):
         }
         resp = self.app.search('/api/person', dumps(search))
         assert resp.status_code == 200
-        #assert loads(resp.data)['error_list'][0] == \
-        #    {'age': 'Please enter a number'}
         assert len(loads(resp.data)['objects']) == 0
 
         # Testing the order_by stuff
@@ -1833,7 +1871,7 @@ class TestSearch(TestSupportPrefilled):
         assert loads(resp.data)['num_results'] == 5
         assert loads(resp.data)['objects'][0]['name'] == u'Lincoln'
 
-         # Testing offset by itself
+        # Testing offset by itself
         search = {'offset': 1}
         resp = self.app.search('/api/person', dumps(search))
         assert resp.status_code == 200
@@ -1846,16 +1884,57 @@ class TestSearch(TestSupportPrefilled):
         assert resp.status_code == 400
         assert loads(resp.data)['message'] == 'Multiple results found'
 
-    def test_search_disjunction(self):
-        """Tests for search with disjunctive filters."""
-        data = dict(filters=[dict(name='age', op='le', val=10),
-                             dict(name='age', op='ge', val=25)],
-                    disjunction=True)
+    def test_search_dates(self):
+        """Test date parsing"""
+        # Lincoln has been allocated a birthday of 1900-01-02.
+        # We'll ask for dates in a variety of formats, including invalid ones.
+        search = {
+            'single': True,
+            'filters': [{'name': 'birth_date', 'op': 'eq'}]
+        }
+
+        # 1900-01-02
+        search['filters'][0]['val'] = '1900-01-02'
+        resp = self.app.search('/api/person', dumps(search))
+        assert loads(resp.data)['name'] == u'Lincoln'
+
+        # 2nd Jan 1900
+        search['filters'][0]['val'] = '2nd Jan 1900'
+        resp = self.app.search('/api/person', dumps(search))
+        assert loads(resp.data)['name'] == u'Lincoln'
+
+        # Invalid Date
+        search['filters'][0]['val'] = 'REALLY-BAD-DATE'
+        resp = self.app.search('/api/person', dumps(search))
+        assert resp.status_code == 400
+
+        # DateTime
+        # This will be cropped to a date, since birth_date is a Date column
+        search['filters'][0]['val'] = '2nd Jan 1900 14:35'
+        resp = self.app.search('/api/person', dumps(search))
+        assert loads(resp.data)['name'] == u'Lincoln'
+
+    def test_search_boolean_formula(self):
+        """Tests for Boolean formulas of filters in a search query."""
+        # This searches for people whose name is John, or people older than age
+        # 10 who have a "y" in their names.
+        #
+        # According to the pre-filled database, this should return three
+        # people: John, Lucy, and Mary.
+        data = {'filters':
+                    [{'or':
+                          [{'and':
+                                [dict(name='name', op='like', val='%y%'),
+                                 dict(name='age', op='ge', val=10)]},
+                           dict(name='name', op='eq', val='John')
+                           ]
+                      }]
+                }
         response = self.app.search('/api/person', dumps(data))
         assert 200 == response.status_code
         data = loads(response.data)['objects']
         assert 3 == len(data)
-        assert set(['Lucy', 'Katy', 'John']) == \
+        assert set(['Lucy', 'Mary', 'John']) == \
             set([person['name'] for person in data])
 
     def test_search_bad_arguments(self):
@@ -1878,8 +1957,20 @@ class TestSearch(TestSupportPrefilled):
         resp = self.app.search('/api/person', dumps(d))
         assert resp.status_code == 400
 
+    def test_like(self):
+        """Tests for the like operator."""
+        person1 = self.Person(name='foo')
+        person2 = self.Person(name='bar')
+        self.session.add_all([person1, person2])
+        self.session.commit()
+        data = dict(filters=[dict(name='name', op='like', val='%bar%')])
+        response = self.app.search('/api/person', urlquote(dumps(data)))
+        data = loads(response.data)
+        people = data['objects']
+        assert ['bar'] == sorted(person['name'] for person in people)
 
-class TestAssociationProxy(DatabaseTestBase):
+
+class TestAssociationProxy(ManagerTestBase):
     """Unit tests for models which have a relationship involving an association
     proxy.
 
@@ -1904,8 +1995,9 @@ class TestAssociationProxy(DatabaseTestBase):
         # proxies that use AssociationDict types
         # this is the association table for Image->metadata
         product_meta = Table('product_meta', self.Base.metadata,
-                 Column('image_id', Integer, ForeignKey('image.id')),
-                 Column('meta_id', Integer, ForeignKey('meta.id')))
+                             Column('image_id', Integer,
+                                    ForeignKey('image.id')),
+                             Column('meta_id', Integer, ForeignKey('meta.id')))
 
         # For brevity, create this association proxy creator functions here.
         creator1 = lambda product: ChosenProductImage(product=product)
@@ -1932,8 +2024,7 @@ class TestAssociationProxy(DatabaseTestBase):
             meta_store = rel('Metadata',
                              cascade='all',
                              backref=backref(name='metadata'),
-                             collection_class=col_mapped(
-                                                    Metadata.__table__.c.key),
+                             collection_class=col_mapped(Metadata.__table__.c.key),
                              secondary=lambda: product_meta)
             meta = prox('meta_store', 'value', creator=creator3)
 
@@ -2037,8 +2128,7 @@ class TestAssociationProxy(DatabaseTestBase):
 
     def test_assoc_dict_put(self):
         data = {'products': [{'id': 1}],
-                'meta': [{'key':'file type', 'value': 'png'}]
-               }
+                'meta': [{'key': 'file type', 'value': 'png'}]}
         response = self.app.post('/api/image', data=dumps(data))
         assert response.status_code == 201
 
