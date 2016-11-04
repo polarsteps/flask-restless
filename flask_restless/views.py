@@ -406,12 +406,13 @@ def extract_error_messages(exception):
     if hasattr(exception, 'message'):
         # TODO this works only if there is one validation error
         try:
+            import traceback
+            traceback.print_stack()
+            current_app.logger.exception(str(exc))
             left, right = str(exception).rsplit(':', 1)
             left_bracket = left.rindex('[')
             right_bracket = right.rindex(']')
         except ValueError as exc:
-            import traceback
-            print traceback.format_exc()
             current_app.logger.exception(str(exc))
             # could not parse the string; we're not trying too hard here...
             return None
