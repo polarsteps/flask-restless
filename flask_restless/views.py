@@ -410,6 +410,8 @@ def extract_error_messages(exception):
             left_bracket = left.rindex('[')
             right_bracket = right.rindex(']')
         except ValueError as exc:
+            import traceback
+            print traceback.format_exc()
             current_app.logger.exception(str(exc))
             # could not parse the string; we're not trying too hard here...
             return None
