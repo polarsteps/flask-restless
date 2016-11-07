@@ -408,7 +408,7 @@ def extract_error_messages(exception):
         try:
             import traceback
             traceback.print_stack()
-            current_app.logger.exception(str(exc))
+            current_app.logger.exception(str(exception))
             left, right = str(exception).rsplit(':', 1)
             left_bracket = left.rindex('[')
             right_bracket = right.rindex(']')
