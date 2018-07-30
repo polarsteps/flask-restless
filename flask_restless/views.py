@@ -1500,7 +1500,7 @@ class API(ModelView):
         """
         import time
         t = int(time.time() * 1000.0)
-        print 'dbgperflib starting at', t
+        print instid, 'dbgperflib starting at', t
 
         content_type = request.headers.get('Content-Type', None)
         content_is_json = content_type.startswith('application/json')
@@ -1541,7 +1541,7 @@ class API(ModelView):
                 # See the note under the preprocessor in the get() method.
                 if temp_result is not None:
                     instid = temp_result
-        print 'dbgperflib preprocessed in', int(time.time() * 1000.0) - t
+        print instid, 'dbgperflib preprocessed in', int(time.time() * 1000.0) - t
         t = int(time.time() * 1000.0)
 
         # Check for any request parameter naming a column which does not exist
@@ -1574,7 +1574,7 @@ class API(ModelView):
         field_list = frozenset(data) ^ relations
         data = dict((field, data[field]) for field in field_list)
 
-        print 'dbgperflib update relation in', int(time.time() * 1000.0) - t
+        print instid, 'dbgperflib update relation in', int(time.time() * 1000.0) - t
         t = int(time.time() * 1000.0)
         # Special case: if there are any dates, convert the string form of the
         # date into an instance of the Python ``datetime`` object.
@@ -1593,8 +1593,6 @@ class API(ModelView):
             current_app.logger.exception(str(exception))
             return self._handle_validation_exception(exception)
 
-        print 'dbgperflib commit changes in', int(time.time() * 1000.0) - t, data, num_modified
-
         # Perform any necessary postprocessing.
         if patchmany:
             result = dict(num_modified=num_modified)
@@ -1603,9 +1601,16 @@ class API(ModelView):
                               search_params=search_params)
         else:
             result = self._instid_to_dict(instid)
+            print instid, 'dbgperflib inst to dict in', int(time.time() * 1000.0) - t
+            t = int(time.time() * 1000.0)
             for postprocessor in self.postprocessors['PATCH_SINGLE']:
                 postprocessor(result=result)
-        print 'dbgperflib postprocessed in', int(time.time() * 1000.0) - t
+                print instid, 'dbgperflib postproc in', int(time.time() * 1000.0) - t
+                t = int(time.time() * 1000.0)
+                import inspect
+                lines = inspect.getsource(postprocessor)
+                print lines
+        print instid, 'dbgperflib postprocessed in', int(time.time() * 1000.0) - t
         t = int(time.time() * 1000.0)
         return result
 
