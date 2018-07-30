@@ -1498,6 +1498,10 @@ class API(ModelView):
            Added the `relationname` keyword argument.
 
         """
+        import time
+        t = int(time.time() * 1000.0)
+        print 'dbgperflib starting at', t
+
         content_type = request.headers.get('Content-Type', None)
         content_is_json = content_type.startswith('application/json')
         is_msie = _is_msie8or9()
@@ -1537,6 +1541,8 @@ class API(ModelView):
                 # See the note under the preprocessor in the get() method.
                 if temp_result is not None:
                     instid = temp_result
+        print 'dbgperflib preprocessed in', int(time.time() * 1000.0) - t
+        t = int(time.time() * 1000.0)
 
         # Check for any request parameter naming a column which does not exist
         # on the current model.
@@ -1568,6 +1574,8 @@ class API(ModelView):
         field_list = frozenset(data) ^ relations
         data = dict((field, data[field]) for field in field_list)
 
+        print 'dbgperflib update relation in', int(time.time() * 1000.0) - t
+        t = int(time.time() * 1000.0)
         # Special case: if there are any dates, convert the string form of the
         # date into an instance of the Python ``datetime`` object.
         data = strings_to_dates(self.model, data)
@@ -1595,7 +1603,8 @@ class API(ModelView):
             result = self._instid_to_dict(instid)
             for postprocessor in self.postprocessors['PATCH_SINGLE']:
                 postprocessor(result=result)
-
+        print 'dbgperflib postprocessed in', int(time.time() * 1000.0) - t
+        t = int(time.time() * 1000.0)
         return result
 
     def put(self, *args, **kw):
