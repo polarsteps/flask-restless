@@ -1064,10 +1064,16 @@ class API(ModelView):
         :http:statuscode:`404`.
 
         """
+        import time
+        t = int(time.time() * 1000.0)
         inst = get_by(self.session, self.model, instid, self.primary_key)
+        print 'dbgperflib 2 get item in', int(time.time() * 1000.0) - t
+        t = int(time.time() * 1000.0)
         if inst is None:
             return {_STATUS: 404}, 404
-        return self._inst_to_dict(inst)
+        d = self._inst_to_dict(inst)
+        print 'dbgperflib 2 item to dict in', int(time.time() * 1000.0) - t
+        return d
 
     def _search(self):
         """Defines a generic search function for the database model.
@@ -1593,6 +1599,9 @@ class API(ModelView):
             current_app.logger.exception(str(exception))
             return self._handle_validation_exception(exception)
 
+        print 'dbgperflib commit changes in', int(time.time() * 1000.0) - t, data, num_modified
+        t = int(time.time() * 1000.0)
+
         # Perform any necessary postprocessing.
         if patchmany:
             result = dict(num_modified=num_modified)
@@ -1601,7 +1610,7 @@ class API(ModelView):
                               search_params=search_params)
         else:
             result = self._instid_to_dict(instid)
-            print instid, 'dbgperflib inst to dict in', int(time.time() * 1000.0) - t
+            print instid, result, 'dbgperflib inst to dict in', int(time.time() * 1000.0) - t
             t = int(time.time() * 1000.0)
             for postprocessor in self.postprocessors['PATCH_SINGLE']:
                 postprocessor(result=result)
