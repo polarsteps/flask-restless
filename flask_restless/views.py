@@ -1593,6 +1593,8 @@ class API(ModelView):
             current_app.logger.exception(str(exception))
             return self._handle_validation_exception(exception)
 
+        print 'dbgperflib commit changes in', int(time.time() * 1000.0) - t, data, num_modified
+
         # Perform any necessary postprocessing.
         if patchmany:
             result = dict(num_modified=num_modified)
