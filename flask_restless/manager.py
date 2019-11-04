@@ -618,19 +618,22 @@ class APIManager(object):
                                defaults={'relationname': None,
                                          'relationinstid': None},
                                view_func=api_view)
-        # add endpoints which expose related models
-        relation_endpoint = '{0}/<relationname>'.format(instance_endpoint)
-        relation_instance_endpoint = \
-            '{0}/<relationinstid>'.format(relation_endpoint)
-        # For example, /api/person/1/computers.
-        blueprint.add_url_rule(relation_endpoint,
-                               methods=possibly_empty_instance_methods,
-                               defaults={'relationinstid': None},
-                               view_func=api_view)
-        # For example, /api/person/1/computers/2.
-        blueprint.add_url_rule(relation_instance_endpoint,
-                               methods=instance_methods,
-                               view_func=api_view)
+
+        # Polarsteps: Do not expose relationships at all
+        # # add endpoints which expose related models
+        # relation_endpoint = '{0}/<relationname>'.format(instance_endpoint)
+        # relation_instance_endpoint = \
+        #     '{0}/<relationinstid>'.format(relation_endpoint)
+        # # For example, /api/person/1/computers.
+        # blueprint.add_url_rule(relation_endpoint,
+        #                        methods=possibly_empty_instance_methods,
+        #                        defaults={'relationinstid': None},
+        #                        view_func=api_view)
+        # # For example, /api/person/1/computers/2.
+        # blueprint.add_url_rule(relation_instance_endpoint,
+        #                        methods=instance_methods,
+        #                        view_func=api_view)
+
         # if function evaluation is allowed, add an endpoint at /api/eval/...
         # which responds only to GET requests and responds with the result of
         # evaluating functions on all instances of the specified model
