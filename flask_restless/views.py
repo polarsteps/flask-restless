@@ -95,12 +95,14 @@ class ProcessingException(HTTPException):
     the case that this exception is raised. `description` is an error message
     describing the cause of this exception. This message will appear in the
     JSON object in the body of the response to the client.
+    `plain` indicates if the description should be presented as is to the user.
 
     """
-    def __init__(self, description='', code=400, *args, **kwargs):
+    def __init__(self, description='', code=400, plain=False, *args, **kwargs):
         super(ProcessingException, self).__init__(*args, **kwargs)
         self.code = code
         self.description = description
+        self.plain = plain
 
 
 class ValidationError(Exception):
@@ -159,7 +161,8 @@ def catch_processing_exceptions(func):
             current_app.logger.exception(str(exception))
             status = exception.code
             message = exception.description or str(exception)
-            return jsonify(message=message), status
+            res = message if exception.plain else {'message': message}
+            return jsonify(**res), status
     return decorator
 
 
