@@ -158,7 +158,8 @@ def catch_processing_exceptions(func):
         try:
             return func(*args, **kw)
         except ProcessingException as exception:
-            current_app.logger.exception(str(exception))
+            if exception.code >= 300:
+                current_app.logger.exception(str(exception))
             status = exception.code
             message = exception.description or str(exception)
             res = message if exception.plain else {'message': message}
